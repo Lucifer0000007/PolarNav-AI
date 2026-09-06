@@ -1,0 +1,17 @@
+{
+  "sensor": "Sentinel-1",
+  "mode": "IW",
+  "polarization": "VV",
+  "bbox": [
+    -68.0,
+    59.5,
+    -67.0,
+    61.0
+  ],
+  "resolution_m": 40,
+  "size_px": [
+    400,
+    400
+  ],
+  "acquisition": "2026-08-14T04:32:00Z"
+}
