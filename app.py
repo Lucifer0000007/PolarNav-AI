@@ -211,9 +211,12 @@ if st.button("🧭 Predict Drift + Generate Route"):
             c4.metric("Risk Reduction %", round(metrics['risk_reduction_pct'], 1))
             c5.metric("Fuel Penalty %", round(metrics['fuel_penalty_pct'], 1))
 
-            st_folium(m, width=1200, height=500)
+            st.session_state["nav_map"] = m
         except Exception as e:
             st.error(f"Route generation failed: {e}")
+
+if "nav_map" in st.session_state:
+    st_folium(st.session_state["nav_map"], width=1200, height=500)
 
 # -----------------------------------------------------------------------------
 # Route History & JSON Exporter
