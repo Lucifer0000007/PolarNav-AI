@@ -21,6 +21,11 @@ KM_PER_CELL = 111.0 / 40.0          # ~2.775 km per cell at 1° latitude
 LAT_MIN, LAT_MAX = -68.0, -67.0
 LON_MIN, LON_MAX = 59.5, 61.0
 
+# Demo scenario: pinned ice field + the start/goal the app defaults to, tuned so
+# the direct route runs through ice and A* buys a visible risk reduction.
+DEMO_SEED = 13
+DEMO_START, DEMO_GOAL = (5, 5), (35, 35)
+
 
 # ----------------------------------------------------------------------
 # Grid <-> lat/lon conversion
@@ -50,15 +55,38 @@ def latlon_to_grid(lat: float, lon: float, size: int = GRID) -> Tuple[int, int]:
 
 
 # ----------------------------------------------------------------------
+# Real-SAR source resolution
+SAR_REAL_PATHS = ("data/sar_real.png", "data/sar_real.tif")
+
+
+def resolve_sar_path(path: str = "data/sar_sample.png") -> str:
+    """
+    Prefer a real Sentinel-1 crop dropped into data/ (sar_real.png/.tif);
+    fall back to the synthetic sample when none has been supplied.
+    """
+    for p in SAR_REAL_PATHS:
+        if os.path.exists(p):
+            return p
+    return path
+
+
+# ----------------------------------------------------------------------
 # 1. Generate synthetic SAR image (grayscale, uint8)
-def make_synthetic_sar(path: str = "data/sar_sample.png", size: int = 400) -> str:
+def make_synthetic_sar(path: str = "data/sar_sample.png", size: int = 400,
+                       seed: Optional[int] = DEMO_SEED) -> str:
     """
     Create a synthetic SAR image with:
       - dark ocean background (10–40)
       - 6–10 bright elliptical ice blobs (150–255)
       - speckle noise (multiplicative)
     Save as PNG and return the path.
+
+    seed pins the ice field so the demo scenario is repeatable run to run;
+    pass seed=None for a fresh random field.
     """
+    if seed is not None:
+        np.random.seed(seed)
+
     dirpath = os.path.dirname(path)
     if dirpath:  # os.makedirs("") raises FileNotFoundError, so only call it when there IS a dir
         os.makedirs(dirpath, exist_ok=True)
@@ -97,6 +125,7 @@ def detect_ice(image_path: str) -> Tuple[np.ndarray, np.ndarray, int]:
     Returns (original_image, binary_mask, ice_pixel_count) — a 3-tuple, so
     the caller can display both the source SAR image and the detected mask.
     """
+    image_path = resolve_sar_path(image_path)  # real crop if present, else the synthetic sample
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Image not found: {image_path}")
@@ -498,6 +527,8 @@ if __name__ == "__main__":
     print(f"SAR saved to {sar_path}")
 
     print("Detecting ice...")
+    resolved = resolve_sar_path(sar_path)
+    print("Source: real Sentinel-1 crop" if resolved != sar_path else "Source: synthetic sample")
     orig_img, mask, ice_cells = detect_ice(sar_path)
     print(f"Ice pixels: {ice_cells}")
 
@@ -505,8 +536,8 @@ if __name__ == "__main__":
     risk_grid = build_risk_grid(mask, GRID)
     print(f"Risk grid shape: {risk_grid.shape}, min={risk_grid.min():.2f}, max={risk_grid.max():.2f}")
 
-    start = (0, 0)
-    goal = (GRID - 1, GRID - 1)
+    start = DEMO_START
+    goal = DEMO_GOAL
     print(f"Start: {start}, Goal: {goal}")
 
     print("Running A*...")
@@ -524,6 +555,16 @@ if __name__ == "__main__":
     print("Computing metrics...")
     metrics = route_metrics(risk_grid, astar_path, direct)
     print(json.dumps(metrics, indent=2))
+
+    # Scenario check: the demo only tells its story if the direct route actually
+    # runs through ice (risk>5 crossings) and A* buys a 50-90% risk reduction.
+    # Printed, not raised: a real sar_real.png crop legitimately shifts these.
+    crossings = metrics['direct_crossings']
+    reduction = metrics['risk_reduction_pct']
+    ok = crossings > 0 and 50.0 <= reduction <= 90.0
+    print(f"Scenario check: direct_crossings={crossings} "
+          f"risk_reduction={reduction:.1f}% -> {'PASS' if ok else 'FAIL'} "
+          f"(target 50-90, crossings>0)")
 
     def path_to_latlon(path):
         return [[grid_to_latlon(r, c)[0], grid_to_latlon(r, c)[1]] for (r, c) in path]

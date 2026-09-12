@@ -9,7 +9,7 @@ import json
 from engine import (
     make_synthetic_sar, detect_ice, build_risk_grid, predict_iceberg_drift,
     astar, direct_path, route_metrics, save_route, load_routes, strict_json,
-    grid_to_latlon, GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
+    grid_to_latlon, resolve_sar_path, GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
 )
 
 # -----------------------------------------------------------------------------
@@ -111,6 +111,11 @@ if st.button("🔍 Detect Ice Hazards"):
             with col2:
                 st.image(mask_img, caption="Detected Ice Mask")
 
+            # Say which imagery the mask came from — a real Sentinel-1 crop
+            # dropped into data/, or the bundled synthetic sample.
+            _src = resolve_sar_path(sar_path)
+            st.caption("Source: real Sentinel-1 crop" if _src != sar_path
+                       else "Source: synthetic sample")
             st.metric("Ice cells", n_cells)
         except Exception as e:
             st.session_state.ice_detected = False
@@ -123,9 +128,20 @@ st.markdown("### 🧭 Route Generation")
 
 # Preset grid coordinates for selection
 coords_list = [(5, 5), (10, 15), (20, 20), (35, 35)]
+
+
+def _coord_label(t):
+    """Show the grid cell with its real position, e.g. "(5, 5) · -67.125, 59.688".
+    Display only — the (r, c) tuple itself is what gets passed to the planner."""
+    lat, lon = grid_to_latlon(*t)
+    return f"{t} · {lat:.3f}, {lon:.3f}"
+
+
 col_s, col_g = st.columns(2)
-start_coord = col_s.selectbox("Start Grid Coordinate", coords_list, index=0)
-goal_coord = col_g.selectbox("Goal Grid Coordinate", coords_list, index=3)
+start_coord = col_s.selectbox("Start Grid Coordinate", coords_list, index=0,
+                               format_func=_coord_label)
+goal_coord = col_g.selectbox("Goal Grid Coordinate", coords_list, index=3,
+                              format_func=_coord_label)
 
 if st.button("🧭 Predict Drift + Generate Route"):
     if not st.session_state.ice_detected:
@@ -135,17 +151,22 @@ if st.button("🧭 Predict Drift + Generate Route"):
             risk_grid = st.session_state.risk_grid
 
             # True offline mode: tiles=None means the browser never requests
-            # basemap images from CartoDB's CDN. A flat rectangle stands in
-            # for the ocean instead — no network round-trip either way.
+            # basemap images from any CDN. A flat rectangle stands in for the
+            # ocean, and the bundled schematic coastline gives it geography.
             m = folium.Map(
                 location=[-67.5, 60.2],
                 zoom_start=8,
-                tiles=None if offline_mode else "CartoDB dark_matter",
+                tiles=None,
             )
-            if offline_mode:
-                folium.Rectangle(
-                    bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
-                    color="#1b2a4a", fill=True, fill_opacity=0.6, weight=0,
+            folium.Rectangle(
+                bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
+                color="#1b2a4a", fill=True, fill_opacity=0.6, weight=0,
+            ).add_to(m)
+            coast_path = "data/coast.geojson"
+            if os.path.exists(coast_path):  # bundled locally; folium inlines it, no fetch
+                folium.GeoJson(
+                    coast_path, name="Coastline",
+                    style_function=lambda f: {"color": "#9aa4b2", "weight": 1.5, "fillOpacity": 0},
                 ).add_to(m)
 
             # Predict iceberg drift (batch, tolerant of empty/missing data)

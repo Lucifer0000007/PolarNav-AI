@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)", "Bash(pip:*)", "Bash(git:*)",
+      "Edit(engine.py)", "Edit(app.py)", "Edit(.streamlit/**)",
+      "Edit(demo.bat)", "Edit(data/**)"
+    ],
+    "deny": [
+      "Bash(pip install:*)",
+      "Edit(README.md)", "Edit(../**)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": "Edit|Write",
+      "hooks": [{
+        "type": "command",
+        "command": "python engine.py"
+      }]
+    }]
+  }
+}

@@ -1,0 +1,1 @@
+If data/sar_real.png or .tif exists, detect_ice uses it (cv2.imread), else synthetic fallback; add UI caption "Source: real Sentinel-1 crop / synthetic sample". No new deps. Run engine self-test. Show diff.

@@ -1,0 +1,1 @@
+Run: engine self-test; grep forbidden imports (requests/urllib/socket/genai/openai/torch/sklearn); Playwright flow F1→F2→F5 in order + out-of-order + refresh (history persists) + screenshot; verify metrics live (not hardcoded). Output: PASS/FAIL table F1–F9 + GO/NO-GO.

@@ -1,0 +1,1 @@
+Set folium.Map(tiles=None); add bundled data/coast.geojson (schematic Antarctic coast, thin gray line). Markers/polylines unchanged. Verify with Playwright: screenshot must show coastline + layers, not empty gray.
