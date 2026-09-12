@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "name": "schematic_antarctic_coast",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"name": "Antarctic coast (schematic)"},
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [59.50, -67.06],
+          [59.65, -67.13],
+          [59.80, -67.11],
+          [59.95, -67.19],
+          [60.10, -67.16],
+          [60.25, -67.24],
+          [60.40, -67.21],
+          [60.55, -67.30],
+          [60.70, -67.26],
+          [60.85, -67.33],
+          [61.00, -67.29]
+        ]
+      }
+    }
+  ]
+}
