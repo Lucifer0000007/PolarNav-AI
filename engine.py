@@ -24,6 +24,10 @@ LON_MIN, LON_MAX = 59.5, 61.0
 # Demo scenario: pinned ice field + the start/goal the app defaults to, tuned so
 # the direct route runs through ice and A* buys a visible risk reduction.
 DEMO_SEED = 13
+
+# Hoisted A* constants (see astar)
+_SQRT2 = math.sqrt(2.0)
+_INF = float('inf')
 DEMO_START, DEMO_GOAL = (5, 5), (35, 35)
 
 
@@ -276,20 +280,32 @@ def astar(risk_grid: Optional[np.ndarray], start: Tuple[int, int], goal: Tuple[i
             0 <= goal[0] < rows and 0 <= goal[1] < cols):
         return None
 
-    def heuristic(a, b):
-        return math.hypot(a[0] - b[0], a[1] - b[1])
+    # Per-cell penalty, precomputed once. Indexing the numpy grid inside the
+    # expansion loop was the hottest line in the whole engine; .tolist() hands
+    # back plain Python floats holding the exact same values.
+    pen = (risk_grid * (risk_weight / 10.0)).tolist()
 
-    dirs = [(-1, -1), (-1, 0), (-1, 1),
-            (0, -1),           (0, 1),
-            (1, -1),  (1, 0),  (1, 1)]
+    # (dr, dc, step_cost) — hypot(dr, dc) is constant per direction, so hoist it
+    # instead of recomputing it on every expansion.
+    dirs = [(-1, -1, _SQRT2), (-1, 0, 1.0), (-1, 1, _SQRT2),
+            (0, -1, 1.0),                   (0, 1, 1.0),
+            (1, -1, _SQRT2),  (1, 0, 1.0),  (1, 1, _SQRT2)]
 
-    open_set = []
-    heapq.heappush(open_set, (0, start))
+    gr, gc = goal
+    open_set = [(0, start)]
     came_from = {}
     g_score = {start: 0}
+    closed = set()          # finalized cells
 
     while open_set:
         _, current = heapq.heappop(open_set)
+        # A cell can sit in the heap several times with different f-scores. The
+        # first pop is its best one; later pops are stale, and re-expanding them
+        # was pure wasted work.
+        if current in closed:
+            continue
+        closed.add(current)
+
         if current == goal:
             path = []
             while current in came_from:
@@ -299,21 +315,23 @@ def astar(risk_grid: Optional[np.ndarray], start: Tuple[int, int], goal: Tuple[i
             path.reverse()
             return path
 
-        for dr, dc in dirs:
-            nr, nc = current[0] + dr, current[1] + dc
+        cr, cc = current
+        base_g = g_score[current]
+        for dr, dc, step in dirs:
+            nr, nc = cr + dr, cc + dc
             if not (0 <= nr < rows and 0 <= nc < cols):
                 continue
 
-            move_cost = math.hypot(dr, dc)
-            risk_penalty = risk_weight * (risk_grid[nr, nc] / 10.0)
-            tentative_g = g_score[current] + move_cost + risk_penalty
-
             neighbor = (nr, nc)
-            if tentative_g < g_score.get(neighbor, float('inf')):
+            if neighbor in closed:      # already finalized, cannot improve
+                continue
+
+            tentative_g = base_g + step + pen[nr][nc]
+            if tentative_g < g_score.get(neighbor, _INF):
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g
-                f_score = tentative_g + heuristic(neighbor, goal)
-                heapq.heappush(open_set, (f_score, neighbor))
+                heapq.heappush(open_set,
+                               (tentative_g + math.hypot(nr - gr, nc - gc), neighbor))
 
     return None  # exhausted the open set without reaching goal — genuinely unreachable
 
