@@ -5,3 +5,5 @@ routes.db
 .env
 .streamlit/
 data/sar_sample.png
+.claude/
+CLAUDE.md

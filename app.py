@@ -28,6 +28,10 @@ st.sidebar.success("Server: OPERATIONAL")
 # -----------------------------------------------------------------------------
 # Session State Initialization — every key any button reads is created up
 # front, so pressing buttons out of order never raises a KeyError/AttributeError.
+#
+# Buttons only ever WRITE here; all rendering happens at page level below. A
+# rerun (file-watcher, widget change, second tab) re-runs the script with every
+# button False, so anything drawn inside a button branch would vanish.
 # -----------------------------------------------------------------------------
 _DEFAULT_ICEBERGS = pd.DataFrame(columns=["id", "lat", "lon", "mass_kt", "freeboard_m"])
 _DEFAULT_WIND = pd.DataFrame(columns=["lat", "lon", "u_wind", "v_wind", "u_current", "v_current"])
@@ -40,12 +44,12 @@ _defaults = {
     "icebergs_df": _DEFAULT_ICEBERGS,
     "wind_df": _DEFAULT_WIND,
     "risk_grid": None,
-    "last_opt_path": None,
-    "last_dir_path": None,
-    "last_metrics": None,
-    "last_start_ll": None,
-    "last_goal_ll": None,
-    "last_drift_list": [],
+    "drop_receipts": [],   # F1 receipts, replayed every rerun
+    "drop_error": None,
+    "ice_view": None,      # F2: {orig, mask, n_cells, source}
+    "ice_error": None,
+    "route_data": None,    # F5: plain data, never a folium.Map object
+    "route_error": None,
 }
 for _key, _val in _defaults.items():
     if _key not in st.session_state:
@@ -83,12 +87,30 @@ if st.button("📡 Simulate Satellite Data Drop"):
         if not os.path.exists(sar_path):
             make_synthetic_sar(sar_path)
         st.session_state.sat_data_loaded = True
-        st.success("✅ data/icebergs.csv ingested successfully.")
-        st.success("✅ data/wind_current.csv ingested successfully.")
-        st.success(f"✅ SAR imagery available at {sar_path}.")
+        st.session_state.drop_error = None
+        st.session_state.drop_receipts = [
+            ("success", "✅ data/icebergs.csv ingested successfully."),
+            ("success", "✅ data/wind_current.csv ingested successfully."),
+            ("success", f"✅ SAR imagery available at {sar_path}."),
+        ]
+        # An empty frame means the CSV was missing or malformed — say so rather
+        # than silently planning around zero icebergs.
+        if st.session_state.icebergs_df.empty:
+            st.session_state.drop_receipts.append(
+                ("info", "data/icebergs.csv unavailable — using empty iceberg defaults."))
+        if st.session_state.wind_df.empty:
+            st.session_state.drop_receipts.append(
+                ("info", "data/wind_current.csv unavailable — using empty wind/current defaults."))
     except Exception as e:
         st.session_state.sat_data_loaded = False
-        st.error(f"Satellite data simulation failed: {e}")
+        st.session_state.drop_receipts = []
+        st.session_state.drop_error = f"Satellite data simulation failed: {e}"
+
+# Page-level replay of the F1 receipts (survives every rerun).
+for _kind, _msg in st.session_state.drop_receipts:
+    (st.success if _kind == "success" else st.info)(_msg)
+if st.session_state.drop_error:
+    st.error(st.session_state.drop_error)
 
 # -----------------------------------------------------------------------------
 # Button 2: Detect Ice Hazards
@@ -104,22 +126,35 @@ if st.button("🔍 Detect Ice Hazards"):
             st.session_state.risk_grid = build_risk_grid(
                 mask_img, GRID, icebergs_df=st.session_state.icebergs_df)
             st.session_state.ice_detected = True
-
-            col1, col2 = st.columns(2)
-            with col1:
-                st.image(orig_img, caption="Original SAR Imagery")
-            with col2:
-                st.image(mask_img, caption="Detected Ice Mask")
+            st.session_state.ice_error = None
 
             # Say which imagery the mask came from — a real Sentinel-1 crop
             # dropped into data/, or the bundled synthetic sample.
             _src = resolve_sar_path(sar_path)
-            st.caption("Source: real Sentinel-1 crop" if _src != sar_path
-                       else "Source: synthetic sample")
-            st.metric("Ice cells", n_cells)
+            st.session_state.ice_view = {
+                "orig": orig_img,
+                "mask": mask_img,
+                "n_cells": n_cells,
+                "source": ("Source: real Sentinel-1 crop" if _src != sar_path
+                           else "Source: synthetic sample"),
+            }
         except Exception as e:
             st.session_state.ice_detected = False
-            st.error(f"Ice detection failed: {e}")
+            st.session_state.ice_view = None
+            st.session_state.ice_error = f"Ice detection failed: {e}"
+
+# Page-level replay of the F2 mask + count (survives every rerun).
+if st.session_state.ice_view is not None:
+    _iv = st.session_state.ice_view
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(_iv["orig"], caption="Original SAR Imagery")
+    with col2:
+        st.image(_iv["mask"], caption="Detected Ice Mask")
+    st.caption(_iv["source"])
+    st.metric("Ice cells", _iv["n_cells"])
+if st.session_state.ice_error:
+    st.error(st.session_state.ice_error)
 
 # -----------------------------------------------------------------------------
 # Button 3: Predict Drift + Generate Route
@@ -149,56 +184,30 @@ if st.button("🧭 Predict Drift + Generate Route"):
     else:
         try:
             risk_grid = st.session_state.risk_grid
-
-            # True offline mode: tiles=None means the browser never requests
-            # basemap images from any CDN. A flat rectangle stands in for the
-            # ocean, and the bundled schematic coastline gives it geography.
-            m = folium.Map(
-                location=[-67.5, 60.2],
-                zoom_start=8,
-                tiles=None,
-            )
-            folium.Rectangle(
-                bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
-                color="#1b2a4a", fill=True, fill_opacity=0.6, weight=0,
-            ).add_to(m)
-            coast_path = "data/coast.geojson"
-            if os.path.exists(coast_path):  # bundled locally; folium inlines it, no fetch
-                folium.GeoJson(
-                    coast_path, name="Coastline",
-                    style_function=lambda f: {"color": "#9aa4b2", "weight": 1.5, "fillOpacity": 0},
-                ).add_to(m)
+            notes = []
 
             # Predict iceberg drift (batch, tolerant of empty/missing data)
             pred_df = predict_iceberg_drift(
                 st.session_state.icebergs_df, st.session_state.wind_df, hours=24.0)
 
-            drift_list = []
+            drift_list = []     # predicted positions only (feeds the strict JSON)
+            iceberg_pairs = []  # (current, predicted) pairs for the drift arrows
             for _, row in pred_df.iterrows():
                 if pd.isna(row.get('pred_lat')) or pd.isna(row.get('pred_lon')):
                     continue
                 curr_loc = [row['lat'], row['lon']]
                 pred_loc = [row['pred_lat'], row['pred_lon']]
                 drift_list.append(pred_loc)
-
-                folium.CircleMarker(curr_loc, color='red', radius=4, fill=True).add_to(m)
-                folium.CircleMarker(pred_loc, color='orange', radius=4, fill=True).add_to(m)
-                folium.PolyLine([curr_loc, pred_loc], color='orange', dash_array='5', weight=2).add_to(m)
+                iceberg_pairs.append((curr_loc, pred_loc))
 
             # Pathfinding — fall back to the direct path if A* can't reach the goal
             # (unreachable goal, missing grid, or out-of-bounds coordinates).
             opt_path = astar(risk_grid, start_coord, goal_coord)
             dir_path = direct_path(risk_grid, start_coord, goal_coord)
             if opt_path is None:
-                st.warning("No A* route found to the goal — showing the direct path instead.")
+                notes.append(("warning",
+                              "No A* route found to the goal — showing the direct path instead."))
                 opt_path = dir_path
-
-            # Map grid coords to lat/lon for mapping
-            opt_latlon = [grid_to_latlon(r, c) for r, c in opt_path]
-            dir_latlon = [grid_to_latlon(r, c) for r, c in dir_path]
-
-            folium.PolyLine(opt_latlon, color='green', weight=4, opacity=0.8).add_to(m)
-            folium.PolyLine(dir_latlon, color='red', dash_array='10', weight=2, opacity=0.6).add_to(m)
 
             # Compute metrics (risk_grid first — matches route_metrics' real signature)
             metrics = route_metrics(risk_grid, opt_path, dir_path)
@@ -206,38 +215,92 @@ if st.button("🧭 Predict Drift + Generate Route"):
             start_ll = grid_to_latlon(*start_coord)
             goal_ll = grid_to_latlon(*goal_coord)
 
-            st.session_state.last_opt_path = opt_path
-            st.session_state.last_dir_path = dir_path
-            st.session_state.last_metrics = metrics
-            st.session_state.last_start_ll = start_ll
-            st.session_state.last_goal_ll = goal_ll
-            st.session_state.last_drift_list = drift_list
-
             saved = save_route(
                 start=start_ll, goal=goal_ll,
                 distance_km=metrics['path_distance_km'],
                 risk_red=metrics['risk_reduction_pct'],
-                path_json=opt_latlon,
+                path_json=[grid_to_latlon(r, c) for r, c in opt_path],
             )
             if not saved:
-                st.info("Route computed, but the local route log couldn't be written this run.")
+                notes.append(("info",
+                              "Route computed, but the local route log couldn't be written this run."))
 
-            # Use the metric keys route_metrics() actually returns.
-            c1, c2, c3, c4, c5 = st.columns(5)
-            risk_diff = metrics['path_risk_score'] - metrics['direct_risk_score']
-            c1.metric("Risk Score", round(metrics['path_risk_score'], 2),
-                       delta=f"{risk_diff:.2f} (vs Direct)", delta_color="inverse")
-            c2.metric("Distance (km)", round(metrics['path_distance_km'], 1))
-            c3.metric("Ice Crossings", metrics['path_crossings'])
-            c4.metric("Risk Reduction %", round(metrics['risk_reduction_pct'], 1))
-            c5.metric("Fuel Penalty %", round(metrics['fuel_penalty_pct'], 1))
-
-            st.session_state["nav_map"] = m
+            # Store DATA, never the folium.Map — the map is rebuilt fresh at
+            # page level on every run from exactly this dict.
+            st.session_state.route_data = {
+                "path": opt_path,
+                "direct": dir_path,
+                "drift_list": drift_list,
+                "metrics": metrics,
+                "icebergs": iceberg_pairs,
+                "start_ll": start_ll,
+                "goal_ll": goal_ll,
+                "notes": notes,
+            }
+            st.session_state.route_error = None
         except Exception as e:
-            st.error(f"Route generation failed: {e}")
+            st.session_state.route_error = f"Route generation failed: {e}"
 
-if "nav_map" in st.session_state:
-    st_folium(st.session_state["nav_map"], width=1200, height=500)
+
+def _build_map(rd: dict) -> folium.Map:
+    """Build a brand-new folium.Map from plain route data. Called once per
+    script run — a Map object is never cached or reused across reruns."""
+    # True offline mode: tiles=None means the browser never requests basemap
+    # images from any CDN. A flat rectangle stands in for the ocean, and the
+    # bundled schematic coastline gives it geography.
+    m = folium.Map(
+        location=[-67.5, 60.2],
+        zoom_start=8,
+        tiles=None,
+    )
+    folium.Rectangle(
+        bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
+        color="#1b2a4a", fill=True, fill_opacity=0.6, weight=0,
+    ).add_to(m)
+    coast_path = "data/coast.geojson"
+    if os.path.exists(coast_path):  # bundled locally; folium inlines it, no fetch
+        folium.GeoJson(
+            coast_path, name="Coastline",
+            style_function=lambda f: {"color": "#9aa4b2", "weight": 1.5, "fillOpacity": 0},
+        ).add_to(m)
+
+    for curr_loc, pred_loc in rd["icebergs"]:
+        folium.CircleMarker(curr_loc, color='red', radius=4, fill=True).add_to(m)
+        folium.CircleMarker(pred_loc, color='orange', radius=4, fill=True).add_to(m)
+        folium.PolyLine([curr_loc, pred_loc], color='orange', dash_array='5', weight=2).add_to(m)
+
+    # Map grid coords to lat/lon for mapping
+    opt_latlon = [grid_to_latlon(r, c) for r, c in rd["path"]]
+    dir_latlon = [grid_to_latlon(r, c) for r, c in rd["direct"]]
+
+    folium.PolyLine(opt_latlon, color='green', weight=4, opacity=0.8).add_to(m)
+    folium.PolyLine(dir_latlon, color='red', dash_array='10', weight=2, opacity=0.6).add_to(m)
+    return m
+
+
+# Page-level render: outside every button, so a rerun redraws the same map
+# instead of dropping it. This is the app's only map-component call site, and
+# its fixed key keeps the component's identity stable across reruns.
+_rd = st.session_state.route_data
+if _rd is not None:
+    for _kind, _msg in _rd["notes"]:
+        (st.warning if _kind == "warning" else st.info)(_msg)
+
+    _metrics = _rd["metrics"]
+    # Use the metric keys route_metrics() actually returns.
+    c1, c2, c3, c4, c5 = st.columns(5)
+    risk_diff = _metrics['path_risk_score'] - _metrics['direct_risk_score']
+    c1.metric("Risk Score", round(_metrics['path_risk_score'], 2),
+               delta=f"{risk_diff:.2f} (vs Direct)", delta_color="inverse")
+    c2.metric("Distance (km)", round(_metrics['path_distance_km'], 1))
+    c3.metric("Ice Crossings", _metrics['path_crossings'])
+    c4.metric("Risk Reduction %", round(_metrics['risk_reduction_pct'], 1))
+    c5.metric("Fuel Penalty %", round(_metrics['fuel_penalty_pct'], 1))
+
+    st_folium(_build_map(_rd), width=1200, height=500,
+              returned_objects=[], key="nav_map")
+if st.session_state.route_error:
+    st.error(st.session_state.route_error)
 
 # -----------------------------------------------------------------------------
 # Route History & JSON Exporter
@@ -250,13 +313,13 @@ else:
     st.info("No route history found locally.")
 
 with st.expander("📋 Strict JSON (NCPOR vessel API)"):
-    if st.session_state.last_opt_path is not None and st.session_state.last_metrics is not None:
+    if _rd is not None:
         json_output = strict_json(
-            st.session_state.last_start_ll,
-            st.session_state.last_goal_ll,
-            [grid_to_latlon(r, c) for r, c in st.session_state.last_opt_path],
-            st.session_state.last_metrics,
-            st.session_state.last_drift_list,
+            _rd["start_ll"],
+            _rd["goal_ll"],
+            [grid_to_latlon(r, c) for r, c in _rd["path"]],
+            _rd["metrics"],
+            _rd["drift_list"],
         )
         st.code(json.dumps(json_output, indent=2), language="json")
     else:
