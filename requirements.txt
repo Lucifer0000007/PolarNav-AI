@@ -1,0 +1,13 @@
+# PolarNav AI - dependencies (SIH26059 core + ML upgrade)
+# torch is NOT listed here - it needs the CPU-only wheel index, which pip's
+# normal index resolution won't pick automatically. Install it separately
+# (see setup_demo.bat), or manually:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+numpy==2.5.3
+pandas==3.0.5
+opencv-python==5.0.0.93
+streamlit==1.64.0
+folium==0.20.0
+streamlit-folium==0.27.4
+scikit-learn==1.9.1
+joblib==1.6.0
