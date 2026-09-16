@@ -9,7 +9,10 @@ No internet. No API keys. No cloud. Runs on a laptop in the Southern Ocean.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Offline](https://img.shields.io/badge/network-zero%20calls-success)
-![Stack](https://img.shields.io/badge/stack-Streamlit%20%2B%20OpenCV%20%2B%20NumPy-orange)
+![Stack](https://img.shields.io/badge/stack-Streamlit%20%2B%20OpenCV%20%2B%20PyTorch*%20%2B%20scikit--learn*-orange)
+
+\* optional — active only once trained weights are committed; Otsu / the physics
+drift formula / flat iceberg weighting are what's actually active until then.
 
 ---
 
@@ -31,7 +34,7 @@ machine.
 | # | Capability | Implementation |
 |---|---|---|
 | **F1** | Satellite data drop | Ingests SAR imagery + iceberg coords + wind/current CSVs |
-| **F2** | Ice hazard detection | OpenCV: Gaussian blur → Otsu threshold → morphological opening |
+| **F2** | Ice hazard detection | OpenCV Otsu (default): Gaussian blur → threshold → morphological opening. Optionally a trained SmallUNet (PyTorch) when `unet_weights.pth` is present, with an automatic fallback to Otsu on a missing/undertrained model |
 | **F3** | Risk grid | 40×40 cells, 0–10 risk, iceberg positions stamped as hard hazards |
 | **F4** | 24-h drift prediction | Vector kinematics — current + 3% wind forcing |
 | **F5** | Risk-aware routing | Modified 8-directional A*, green optimal vs. red direct baseline |
@@ -117,7 +120,12 @@ python -m venv venv
 venv\Scripts\activate                 # Windows
 # source venv/bin/activate            # macOS / Linux
 
-pip install streamlit folium streamlit-folium pandas numpy opencv-python
+pip install -r requirements.txt
+
+# Optional ML core (SIH26059 AI/ML requirement) - CPU-only, installed
+# separately since it needs the CPU wheel index:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
+# (see setup_demo.bat for a one-shot offline-prep install of everything)
 ```
 
 Run the offline self-test (no browser, validates the whole engine):
@@ -170,7 +178,7 @@ PolarNav-AI/
 ├── engine.py              # All navigation logic - pure numpy/OpenCV/stdlib
 │   ├── grid_to_latlon()   #   grid <-> geographic conversion (clamped)
 │   ├── resolve_sar_path() #   real-SAR preference with synthetic fallback
-│   ├── detect_ice()       #   F2 - returns (original, mask, pixel_count)
+│   ├── detect_ice()       #   F2 - returns (original, mask, pixel_count, active_path)
 │   ├── build_risk_grid()  #   F3 - 0..10 risk field
 │   ├── predict_drift()    #   F4 - current + 3% wind
 │   ├── astar()            #   F5 - risk-weighted, None if unreachable
@@ -248,13 +256,16 @@ persists through widget changes and file-watcher reruns instead of flickering aw
 |---|---|---|
 | UI | Streamlit | Zero-config local server, no frontend build |
 | Mapping | Folium + streamlit-folium | Renders client-side with tiles disabled |
-| Vision | OpenCV | Otsu and morphology, no model weights to ship |
+| Vision | OpenCV (+ optional SmallUNet) | Otsu/morphology is the shipped default; a PyTorch U-Net activates only once trained weights pass the accuracy bar |
+| Drift | Physics formula (+ optional Ridge) | Current+wind kinematics is the default; a scikit-learn Ridge model activates only once trained and committed |
 | Compute | NumPy | Vectorized risk grid |
 | Data | pandas | CSV ingest with column validation |
 | Storage | SQLite (stdlib) | Serverless persistence |
 
-**Six dependencies. No ML frameworks, no model downloads, no GPU.** The install
-works on any vessel laptop.
+**Eight core dependencies, CPU-only.** PyTorch and scikit-learn are optional
+additions mandated by SIH26059's AI/ML requirement — no GPU required, and every
+ML path has a non-ML fallback that is what's actually active until trained
+weights ship (see `requirements.txt` / `setup_demo.bat`).
 
 ---
 
