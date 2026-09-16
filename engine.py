@@ -253,16 +253,48 @@ def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.n
 
 
 # ----------------------------------------------------------------------
+# ML core: KMeans ice-class profiling (optional, internal-only — no new
+# output fields). Falls back to a flat risk value when unavailable.
+def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> np.ndarray:
+    """
+    Cluster icebergs by size (mass_kt, freeboard_m) into risk tiers via
+    KMeans so bigger/taller icebergs stamp a higher risk value than smaller
+    ones. Returns one risk value per row in [7, 10]; falls back to a flat
+    10.0 per row when scikit-learn is unavailable, there are too few rows to
+    cluster, the required columns are missing, or clustering fails for any
+    reason — this must never crash risk-grid construction.
+    """
+    n = len(icebergs_df)
+    flat = np.full(n, 10.0)
+    if KMeans is None or n < n_clusters or not {'mass_kt', 'freeboard_m'}.issubset(icebergs_df.columns):
+        return flat
+    try:
+        features = icebergs_df[['mass_kt', 'freeboard_m']].to_numpy(dtype=np.float64)
+        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=DEMO_SEED).fit(features)
+        cluster_means = [features[km.labels_ == k].mean() if np.any(km.labels_ == k) else 0.0
+                          for k in range(n_clusters)]
+        order = np.argsort(cluster_means)  # smallest cluster first
+        tier_risk = np.linspace(7.0, 10.0, n_clusters)
+        risk_by_cluster = {cluster: tier_risk[rank] for rank, cluster in enumerate(order)}
+        return np.array([risk_by_cluster[label] for label in km.labels_])
+    except Exception:
+        return flat
+
+
+# ----------------------------------------------------------------------
 # 3. Build risk grid (0..10)
 def build_risk_grid(mask: np.ndarray, size: int = GRID,
-                     icebergs_df: Optional[pd.DataFrame] = None) -> np.ndarray:
+                     icebergs_df: Optional[pd.DataFrame] = None,
+                     use_kmeans: bool = True) -> np.ndarray:
     """
     Resize mask to (size,size), convert to float, set >0 to 10, optionally
     stamp known iceberg positions in as hard-risk cells, blur, clip to 0..10.
 
     icebergs_df is optional and defensive: a missing df, an empty df, a df
     without lat/lon columns, or a row with a bad value are all tolerated —
-    none of them should crash a first-run demo.
+    none of them should crash a first-run demo. When use_kmeans is True and
+    scikit-learn is available, iceberg risk is profiled by size (see
+    _kmeans_risk_weights) instead of a flat 10.0 per iceberg.
     """
     resized = cv2.resize(mask.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA)
     risk = np.where(resized > 0, 10.0, 0.0)
@@ -278,7 +310,8 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
             lon_span = (LON_MAX - LON_MIN) or 1.0
             rs = np.clip(np.round(size * (1.0 - (lats[valid] - LAT_MIN))), 0, size - 1).astype(int)
             cs = np.clip(np.round(size * (lons[valid] - LON_MIN) / lon_span), 0, size - 1).astype(int)
-            risk[rs, cs] = 10.0
+            weights = _kmeans_risk_weights(icebergs_df)[valid] if use_kmeans else np.full(valid.sum(), 10.0)
+            risk[rs, cs] = weights
 
     risk = cv2.GaussianBlur(risk, (5, 5), 0)
     risk = np.clip(risk, 0.0, 10.0)
