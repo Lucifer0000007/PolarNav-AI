@@ -95,18 +95,95 @@ def resolve_sar_path(path: str = "data/sar_sample.png") -> str:
 
 
 # ----------------------------------------------------------------------
+# NSIDC Sea Ice Index (Antarctic/south) — makes the synthetic SAR patch
+# physics-informed: a real historical extent drives how much ice the
+# synthetic field shows, instead of an arbitrary fixed blob count.
+SEAICE_CSV_PATH = "seaice.csv"
+SEAICE_EXTENT_MIN = 2.0   # million km^2 -> ~0% patch ice coverage
+SEAICE_EXTENT_MAX = 19.0  # million km^2 -> ~100% patch ice coverage
+
+_seaice_df_cache: Dict[str, Any] = {}
+
+
+def load_seaice_south(csv_path: str = SEAICE_CSV_PATH) -> pd.DataFrame:
+    """
+    Load the NSIDC Sea Ice Index CSV, return only Antarctic (hemisphere ==
+    'south') rows with column names stripped of stray whitespace (the raw
+    CSV header has leading spaces, e.g. ' Month'). Never raises: a missing
+    file, a malformed CSV, or a file with no usable rows all degrade to an
+    empty frame — callers must fall back to the pinned default field.
+    """
+    if csv_path in _seaice_df_cache:
+        return _seaice_df_cache[csv_path]
+
+    empty = pd.DataFrame(columns=["Year", "Month", "Day", "Extent"])
+    if not os.path.exists(csv_path):
+        _seaice_df_cache[csv_path] = empty
+        return empty
+    try:
+        df = pd.read_csv(csv_path)
+        df.columns = [c.strip() for c in df.columns]
+        if not {"hemisphere", "Extent"}.issubset(df.columns):
+            df = empty
+        else:
+            df = df[df["hemisphere"].astype(str).str.strip() == "south"].copy()
+            df["Extent"] = pd.to_numeric(df["Extent"], errors="coerce")
+            df = df.dropna(subset=["Extent"])
+    except Exception:
+        df = empty
+    _seaice_df_cache[csv_path] = df
+    return df
+
+
+def sample_seaice_row(csv_path: str = SEAICE_CSV_PATH) -> Optional[Dict[str, Any]]:
+    """
+    Pick one random Antarctic (south) row from the NSIDC CSV. Returns None
+    (never raises) when the CSV is missing/empty/malformed — the caller
+    should fall back to the pinned DEMO_SEED synthetic field.
+    """
+    df = load_seaice_south(csv_path)
+    if df.empty:
+        return None
+    row = df.sample(n=1).iloc[0]
+    return {
+        "year": int(row["Year"]),
+        "month": int(row["Month"]),
+        "day": int(row["Day"]),
+        "extent": float(row["Extent"]),
+    }
+
+
+def extent_to_coverage(extent_mkm2: float) -> float:
+    """
+    Normalize a real NSIDC extent (million km^2) to a 0..1 ice-coverage
+    fraction for the synthetic SAR patch: SEAICE_EXTENT_MIN -> 0.0,
+    SEAICE_EXTENT_MAX -> 1.0, clamped to that range.
+    """
+    span = (SEAICE_EXTENT_MAX - SEAICE_EXTENT_MIN) or 1.0
+    frac = (extent_mkm2 - SEAICE_EXTENT_MIN) / span
+    return max(0.0, min(1.0, frac))
+
+
+# ----------------------------------------------------------------------
 # 1. Generate synthetic SAR image (grayscale, uint8)
 def make_synthetic_sar(path: str = "data/sar_sample.png", size: int = 400,
-                       seed: Optional[int] = DEMO_SEED) -> str:
+                       seed: Optional[int] = DEMO_SEED,
+                       target_extent: Optional[float] = None) -> str:
     """
     Create a synthetic SAR image with:
       - dark ocean background (10–40)
-      - 6–10 bright elliptical ice blobs (150–255)
+      - bright elliptical ice blobs (150–255)
       - speckle noise (multiplicative)
     Save as PNG and return the path.
 
     seed pins the ice field so the demo scenario is repeatable run to run;
     pass seed=None for a fresh random field.
+
+    If target_extent is given (million km^2, NSIDC-style — see
+    sample_seaice_row), the blob count is scaled by extent_to_coverage()
+    instead of the fixed 6-10 range, so the synthetic patch's ice density
+    reflects a real historical Antarctic extent rather than an arbitrary
+    count.
     """
     if seed is not None:
         np.random.seed(seed)
@@ -116,7 +193,11 @@ def make_synthetic_sar(path: str = "data/sar_sample.png", size: int = 400,
         os.makedirs(dirpath, exist_ok=True)
 
     img = np.random.randint(10, 41, (size, size), dtype=np.uint8)
-    n_blobs = np.random.randint(6, 11)
+    if target_extent is not None:
+        coverage = extent_to_coverage(target_extent)
+        n_blobs = int(round(2 + coverage * 18))  # 2..20 blobs across the real extent range
+    else:
+        n_blobs = np.random.randint(6, 11)
 
     for _ in range(n_blobs):
         center = (np.random.randint(0, size), np.random.randint(0, size))
@@ -144,38 +225,70 @@ def make_synthetic_sar(path: str = "data/sar_sample.png", size: int = 400,
 # ----------------------------------------------------------------------
 # ML core: SmallUNet segmentation (optional, CPU-only inference).
 # Otsu (below) is the permanent fallback — never removed, always reachable.
-UNET_WEIGHTS_PATH = "unet_weights.pth"
+#
+# Architecture ported from sea-ice-segmentation-u-net.ipynb's get_unet():
+# same filter progression (32-64-128-256, bottleneck 512), same Dropout(0.5)
+# after every pool/concat, and the same upsample+conv decoder (the notebook
+# uses UpSampling2D+Conv2D, not a transposed convolution) with skip
+# connections. Adapted for grayscale SAR input (in_channels=1) and binary
+# ice/no-ice output (out_channels=1, sigmoid via BCEWithLogitsLoss, applied
+# by the caller) instead of the notebook's 3-channel RGB input and 8-class
+# softmax output over ice-concentration categories.
+UNET_WEIGHTS_PATH = "models/unet_weights.pth"
 
 if torch is not None:
     class SmallUNet(nn.Module):
-        """3-level U-Net, base width 16 — small enough for CPU inference."""
+        """U-Net, architecture synced with sea-ice-segmentation-u-net.ipynb."""
 
-        def __init__(self, base: int = 16):
+        def __init__(self, in_channels: int = 1, out_channels: int = 1):
             super().__init__()
 
-            def block(cin, cout):
+            def conv_block(cin, cout):
                 return nn.Sequential(
                     nn.Conv2d(cin, cout, 3, padding=1), nn.ReLU(inplace=True),
                     nn.Conv2d(cout, cout, 3, padding=1), nn.ReLU(inplace=True),
                 )
 
-            self.enc1 = block(1, base)
-            self.enc2 = block(base, base * 2)
-            self.enc3 = block(base * 2, base * 4)
+            def up_conv(cin, cout):
+                # Matches the notebook's UpSampling2D(2) -> Conv2D (not ConvTranspose2d).
+                return nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="nearest"),
+                    nn.Conv2d(cin, cout, 3, padding=1), nn.ReLU(inplace=True),
+                )
+
             self.pool = nn.MaxPool2d(2)
-            self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
-            self.dec2 = block(base * 4, base * 2)
-            self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
-            self.dec1 = block(base * 2, base)
-            self.out = nn.Conv2d(base, 1, 1)
+            self.drop = nn.Dropout(0.5)
+
+            self.enc1 = conv_block(in_channels, 32)
+            self.enc2 = conv_block(32, 64)
+            self.enc3 = conv_block(64, 128)
+            self.enc4 = conv_block(128, 256)
+            self.bottleneck = conv_block(256, 512)
+
+            self.up6 = up_conv(512, 256)
+            self.dec6 = conv_block(512, 256)
+            self.up7 = up_conv(256, 128)
+            self.dec7 = conv_block(256, 128)
+            self.up8 = up_conv(128, 64)
+            self.dec8 = conv_block(128, 64)
+            self.up9 = up_conv(64, 32)
+            self.dec9 = conv_block(64, 32)
+
+            self.out = nn.Conv2d(32, out_channels, 1)
 
         def forward(self, x):
-            e1 = self.enc1(x)
-            e2 = self.enc2(self.pool(e1))
-            e3 = self.enc3(self.pool(e2))
-            d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
-            d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
-            return self.out(d1)
+            c1 = self.enc1(x)
+            c2 = self.enc2(self.drop(self.pool(c1)))
+            c3 = self.enc3(self.drop(self.pool(c2)))
+            c4 = self.enc4(self.drop(self.pool(c3)))
+            c5 = self.bottleneck(self.drop(self.pool(c4)))
+
+            d6 = self.dec6(self.drop(torch.cat([self.up6(c5), c4], dim=1)))
+            d7 = self.dec7(self.drop(torch.cat([self.up7(d6), c3], dim=1)))
+            d8 = self.dec8(self.drop(torch.cat([self.up8(d7), c2], dim=1)))
+            d9 = self.dec9(self.drop(torch.cat([self.up9(d8), c1], dim=1)))
+
+            return self.out(d9)  # logits — caller applies sigmoid (binary, not the notebook's softmax)
 
 
 _unet_model_cache: Dict[str, Any] = {}

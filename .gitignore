@@ -3,7 +3,7 @@ __pycache__/
 *.pyc
 routes.db
 .env
-.streamlit/
+patches/
 data/sar_sample.png
 .claude/
 CLAUDE.md

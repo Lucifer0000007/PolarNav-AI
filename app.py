@@ -9,7 +9,8 @@ import json
 from engine import (
     make_synthetic_sar, detect_ice, build_risk_grid, predict_iceberg_drift,
     astar, direct_path, route_metrics, save_route, load_routes, strict_json,
-    grid_to_latlon, resolve_sar_path, GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
+    grid_to_latlon, resolve_sar_path, sample_seaice_row,
+    GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
 )
 
 # -----------------------------------------------------------------------------
@@ -46,6 +47,7 @@ _defaults = {
     "risk_grid": None,
     "drop_receipts": [],   # F1 receipts, replayed every rerun
     "drop_error": None,
+    "seaice_context": None,  # F1: sampled NSIDC {year, month, day, extent} or None
     "ice_view": None,      # F2: {orig, mask, n_cells, source}
     "ice_error": None,
     "route_data": None,    # F5: plain data, never a folium.Map object
@@ -84,8 +86,17 @@ if st.button("📡 Simulate Satellite Data Drop"):
 
     sar_path = "data/sar_sample.png"
     try:
-        if not os.path.exists(sar_path):
-            make_synthetic_sar(sar_path)
+        # Physics-informed synthetic SAR: pick a random real Antarctic extent
+        # from the NSIDC Sea Ice Index and scale the ice-blob density to it,
+        # instead of an arbitrary fixed blob count. Regenerated every press so
+        # each data drop reflects a (possibly different) real historical day.
+        seaice_row = sample_seaice_row()
+        if seaice_row is not None:
+            make_synthetic_sar(sar_path, target_extent=seaice_row["extent"])
+        elif not os.path.exists(sar_path):
+            make_synthetic_sar(sar_path)  # seaice.csv unavailable — pinned default field
+        st.session_state.seaice_context = seaice_row
+
         st.session_state.sat_data_loaded = True
         st.session_state.drop_error = None
         st.session_state.drop_receipts = [
@@ -93,6 +104,10 @@ if st.button("📡 Simulate Satellite Data Drop"):
             ("success", "✅ data/wind_current.csv ingested successfully."),
             ("success", f"✅ SAR imagery available at {sar_path}."),
         ]
+        if seaice_row is not None:
+            st.session_state.drop_receipts.append(
+                ("info", f"Context: {seaice_row['year']:04d}-{seaice_row['month']:02d}-"
+                         f"{seaice_row['day']:02d} | Extent: {seaice_row['extent']:.1f} M km² (NSIDC)"))
         # An empty frame means the CSV was missing or malformed — say so rather
         # than silently planning around zero icebergs.
         if st.session_state.icebergs_df.empty:
@@ -104,6 +119,7 @@ if st.button("📡 Simulate Satellite Data Drop"):
     except Exception as e:
         st.session_state.sat_data_loaded = False
         st.session_state.drop_receipts = []
+        st.session_state.seaice_context = None
         st.session_state.drop_error = f"Satellite data simulation failed: {e}"
 
 # Page-level replay of the F1 receipts (survives every rerun).
@@ -309,9 +325,9 @@ if _rd is not None:
 
     _iv2 = st.session_state.ice_view
     if _iv2 is not None:
-        _model_txt = "U-Net Weights" if "SmallUNet" in _iv2["active_path"] else "OpenCV Surrogate"
-        _sar_txt = "Real Crop" if "real Sentinel-1" in _iv2["source"] else "Synthetic Sample"
-        st.caption(f"Active Inference: {_model_txt} | SAR Source: {_sar_txt}")
+        _active_txt = "U-Net" if "SmallUNet" in _iv2["active_path"] else "Otsu"
+        st.caption(f"Data Source: NSIDC Sea Ice Index (Surrogate) | "
+                   f"Model: Notebook Architecture | Active Path: {_active_txt}")
 if st.session_state.route_error:
     st.error(st.session_state.route_error)
 

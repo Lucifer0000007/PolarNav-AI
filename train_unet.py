@@ -75,11 +75,35 @@ def _list_patch_names():
     return names
 
 
+def augment_patch(img: np.ndarray, mask: np.ndarray):
+    """
+    Port of sea-ice-segmentation-u-net.ipynb's augment_image(): random
+    horizontal flip (p=0.5), random vertical flip (p=0.5), then a random
+    rotation in +-5 degrees (continuous, matching the notebook's
+    np.pi/36*uniform(-1,1) range), applied identically to image and mask.
+    Uses cv2 (already a dependency) in place of tensorflow_addons.
+    """
+    if np.random.rand() < 0.5:
+        img = np.fliplr(img)
+        mask = np.fliplr(mask)
+    if np.random.rand() < 0.5:
+        img = np.flipud(img)
+        mask = np.flipud(mask)
+
+    angle = np.random.uniform(-5.0, 5.0)
+    h, w = img.shape[:2]
+    rot_mat = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), angle, 1.0)
+    img = cv2.warpAffine(img, rot_mat, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    mask = cv2.warpAffine(mask, rot_mat, (w, h), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return np.ascontiguousarray(img), np.ascontiguousarray(mask)
+
+
 class PatchDataset(Dataset):
     """Loads (image, mask) pairs as float32 tensors, image in [0,1], mask in {0,1}."""
 
-    def __init__(self, names):
+    def __init__(self, names, augment: bool = False):
         self.names = names
+        self.augment = augment
 
     def __len__(self):
         return len(self.names)
@@ -90,6 +114,8 @@ class PatchDataset(Dataset):
         mask = cv2.imread(os.path.join(MASKS_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
         if img is None or mask is None:
             raise RuntimeError(f"Failed to read patch pair for '{name}'")
+        if self.augment:
+            img, mask = augment_patch(img, mask)
         x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
         y = torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0)
         return x, y
@@ -111,9 +137,29 @@ def dice_loss(logits, target, eps=1e-6):
     return 1.0 - (2.0 * inter + eps) / (union + eps)
 
 
-def train(model, loader, epochs, lr=1e-3):
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+def _holdout_val_loss(model, bce, names) -> float:
+    """BCE+Dice loss on the held-out set, used only to drive the LR scheduler
+    (mirrors the notebook's ReduceLROnPlateau monitoring val_loss) — never
+    used for a gradient step, so this doesn't leak into training weights."""
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for name in names:
+            img = cv2.imread(os.path.join(IMAGES_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imread(os.path.join(MASKS_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
+            x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+            y = torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+            logits = model(x)
+            losses.append((bce(logits, y) + dice_loss(logits, y)).item())
+    model.train()
+    return float(np.mean(losses)) if losses else 0.0
+
+
+def train(model, loader, holdout_names, epochs, lr=1e-3):
+    opt = torch.optim.Adam(model.parameters(), lr=lr)  # matches notebook's Adam() default lr=0.001
     bce = nn.BCEWithLogitsLoss()
+    # Mirrors the notebook's ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=8).
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.8, patience=8)
     model.train()
     for epoch in range(epochs):
         total_loss = 0.0
@@ -124,7 +170,10 @@ def train(model, loader, epochs, lr=1e-3):
             loss.backward()
             opt.step()
             total_loss += loss.item()
-        print(f"epoch {epoch + 1}/{epochs}  loss={total_loss / max(1, len(loader)):.4f}")
+        train_loss = total_loss / max(1, len(loader))
+        val_loss = _holdout_val_loss(model, bce, holdout_names)
+        scheduler.step(val_loss)
+        print(f"epoch {epoch + 1}/{epochs}  loss={train_loss:.4f}  val_loss={val_loss:.4f}")
 
 
 def evaluate_unet(model, names):
@@ -174,9 +223,9 @@ def main():
     train_names = names[:-args.holdout]
     print(f"{len(train_names)} training patches, {len(holdout_names)} held out.")
 
-    loader = DataLoader(PatchDataset(train_names), batch_size=args.batch_size, shuffle=True)
+    loader = DataLoader(PatchDataset(train_names, augment=True), batch_size=args.batch_size, shuffle=True)
     model = SmallUNet()
-    train(model, loader, epochs=args.epochs, lr=args.lr)
+    train(model, loader, holdout_names, epochs=args.epochs, lr=args.lr)
 
     dice_unet = evaluate_unet(model, holdout_names)
     dice_otsu = evaluate_otsu(holdout_names)
@@ -194,6 +243,9 @@ def main():
         "epochs": args.epochs,
     }
     if bar_passed:
+        weights_dir = os.path.dirname(UNET_WEIGHTS_PATH)
+        if weights_dir:
+            os.makedirs(weights_dir, exist_ok=True)
         torch.save(model.state_dict(), UNET_WEIGHTS_PATH)
         report["note"] = f"Bar passed - weights saved to {UNET_WEIGHTS_PATH}."
         print(report["note"])
