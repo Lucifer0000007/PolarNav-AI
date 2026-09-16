@@ -17,11 +17,11 @@ from engine import (
 # -----------------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="🧊 PolarNav AI")
 
-st.title("🧊 PolarNav AI — Offline Antarctic Navigation")
+st.title("🧊 PolarNav AI — Edge-Native Antarctic Decision Support")
 
 # Sidebar — the toggle's value is now actually used (see map tiles below)
 # instead of being discarded.
-offline_mode = st.sidebar.toggle("Offline Onboard Mode", value=True)
+offline_mode = st.sidebar.toggle("Edge-Native Mode (Offline)", value=True)
 st.sidebar.caption("Connectivity: OUTAGE SIMULATED" if offline_mode else "Connectivity: ONLINE")
 st.sidebar.success("Server: OPERATIONAL")
 
@@ -115,7 +115,7 @@ if st.session_state.drop_error:
 # -----------------------------------------------------------------------------
 # Button 2: Detect Ice Hazards
 # -----------------------------------------------------------------------------
-if st.button("🔍 Detect Ice Hazards"):
+if st.button("🔍 Detect Ice (U-Net / OpenCV Surrogate)"):
     if not st.session_state.sat_data_loaded:
         st.warning("Please simulate satellite data drop first.")
     else:
@@ -163,7 +163,8 @@ if st.session_state.ice_error:
 # -----------------------------------------------------------------------------
 # Button 3: Predict Drift + Generate Route
 # -----------------------------------------------------------------------------
-st.markdown("### 🧭 Route Generation")
+st.markdown("### ⚓ Risk-Aware Routing")
+st.caption("🧭 Forecast Drift (Vector Kinematics) — computed together with the route below.")
 
 # Preset grid coordinates for selection
 coords_list = [(5, 5), (10, 15), (20, 20), (35, 35)]
@@ -182,7 +183,7 @@ start_coord = col_s.selectbox("Start Grid Coordinate", coords_list, index=0,
 goal_coord = col_g.selectbox("Goal Grid Coordinate", coords_list, index=3,
                               format_func=_coord_label)
 
-if st.button("🧭 Predict Drift + Generate Route"):
+if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
     if not st.session_state.ice_detected:
         st.warning("Please detect ice hazards first.")
     else:
@@ -294,15 +295,23 @@ if _rd is not None:
     # Use the metric keys route_metrics() actually returns.
     c1, c2, c3, c4, c5 = st.columns(5)
     risk_diff = _metrics['path_risk_score'] - _metrics['direct_risk_score']
-    c1.metric("Risk Score", round(_metrics['path_risk_score'], 2),
+    c1.metric("Risk Exposure", round(_metrics['path_risk_score'], 2),
                delta=f"{risk_diff:.2f} (vs Direct)", delta_color="inverse")
     c2.metric("Distance (km)", round(_metrics['path_distance_km'], 1))
     c3.metric("Ice Crossings", _metrics['path_crossings'])
     c4.metric("Risk Reduction %", round(_metrics['risk_reduction_pct'], 1))
-    c5.metric("Fuel Penalty %", round(_metrics['fuel_penalty_pct'], 1))
+    c5.metric("Fuel/Time Trade-off", f"{round(_metrics['fuel_penalty_pct'], 1)}%")
 
     st_folium(_build_map(_rd), width=1200, height=500,
               returned_objects=[], key="nav_map")
+
+    st.info("🧑‍✈️ Human-in-the-loop: AI recommends the safest path, captain retains final authority.")
+
+    _iv2 = st.session_state.ice_view
+    if _iv2 is not None:
+        _model_txt = "U-Net Weights" if "SmallUNet" in _iv2["active_path"] else "OpenCV Surrogate"
+        _sar_txt = "Real Crop" if "real Sentinel-1" in _iv2["source"] else "Synthetic Sample"
+        st.caption(f"Active Inference: {_model_txt} | SAR Source: {_sar_txt}")
 if st.session_state.route_error:
     st.error(st.session_state.route_error)
 
