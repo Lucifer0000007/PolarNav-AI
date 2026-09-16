@@ -212,11 +212,11 @@ def _unet_segment(img: np.ndarray, model) -> np.ndarray:
 
 # ----------------------------------------------------------------------
 # 2. Ice detection
-def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.ndarray, int]:
+def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.ndarray, int, str]:
     """
     Load image, segment ice, return (original_image, binary_mask,
-    ice_pixel_count) — a 3-tuple, so the caller can display both the source
-    SAR image and the detected mask.
+    ice_pixel_count, active_path) — active_path is "unet" or "otsu", so the
+    caller can honestly caption which inference path actually ran.
 
     If use_unet and a trained SmallUNet is available (see load_unet_model),
     tries it first. Falls back to Gaussian blur + Otsu threshold +
@@ -230,6 +230,7 @@ def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.n
         raise FileNotFoundError(f"Image not found: {image_path}")
 
     mask = None
+    active_path = "otsu"
     if use_unet:
         model = load_unet_model()
         if model is not None:
@@ -238,6 +239,7 @@ def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.n
                 coverage = np.count_nonzero(candidate) / candidate.size
                 if 0.01 <= coverage <= 0.60:
                     mask = candidate
+                    active_path = "unet"
             except Exception:
                 mask = None
 
@@ -247,9 +249,10 @@ def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.n
 
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        active_path = "otsu"
 
     ice_cells = int(np.count_nonzero(mask))
-    return img, mask, ice_cells
+    return img, mask, ice_cells, active_path
 
 
 # ----------------------------------------------------------------------
@@ -749,8 +752,8 @@ if __name__ == "__main__":
     print("Detecting ice...")
     resolved = resolve_sar_path(sar_path)
     print("Source: real Sentinel-1 crop" if resolved != sar_path else "Source: synthetic sample")
-    orig_img, mask, ice_cells = detect_ice(sar_path)
-    print(f"Ice pixels: {ice_cells}")
+    orig_img, mask, ice_cells, ice_path = detect_ice(sar_path)
+    print(f"Ice pixels: {ice_cells} (active path: {ice_path})")
 
     print("Building risk grid...")
     risk_grid = build_risk_grid(mask, GRID)

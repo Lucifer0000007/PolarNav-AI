@@ -121,7 +121,7 @@ if st.button("🔍 Detect Ice Hazards"):
     else:
         sar_path = "data/sar_sample.png"
         try:
-            orig_img, mask_img, n_cells = detect_ice(sar_path)
+            orig_img, mask_img, n_cells, ice_path = detect_ice(sar_path)
 
             st.session_state.risk_grid = build_risk_grid(
                 mask_img, GRID, icebergs_df=st.session_state.icebergs_df)
@@ -129,7 +129,8 @@ if st.button("🔍 Detect Ice Hazards"):
             st.session_state.ice_error = None
 
             # Say which imagery the mask came from — a real Sentinel-1 crop
-            # dropped into data/, or the bundled synthetic sample.
+            # dropped into data/, or the bundled synthetic sample — and which
+            # inference path actually produced the mask.
             _src = resolve_sar_path(sar_path)
             st.session_state.ice_view = {
                 "orig": orig_img,
@@ -137,6 +138,8 @@ if st.button("🔍 Detect Ice Hazards"):
                 "n_cells": n_cells,
                 "source": ("Source: real Sentinel-1 crop" if _src != sar_path
                            else "Source: synthetic sample"),
+                "active_path": ("Active model: SmallUNet (trained weights)" if ice_path == "unet"
+                                 else "Active model: OpenCV Otsu (fallback)"),
             }
         except Exception as e:
             st.session_state.ice_detected = False
@@ -152,6 +155,7 @@ if st.session_state.ice_view is not None:
     with col2:
         st.image(_iv["mask"], caption="Detected Ice Mask")
     st.caption(_iv["source"])
+    st.caption(_iv["active_path"])
     st.metric("Ice cells", _iv["n_cells"])
 if st.session_state.ice_error:
     st.error(st.session_state.ice_error)
