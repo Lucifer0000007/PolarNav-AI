@@ -34,7 +34,7 @@ machine.
 | # | Capability | Implementation |
 |---|---|---|
 | **F1** | Satellite data drop | Ingests SAR imagery + iceberg coords + wind/current CSVs |
-| **F2** | Ice hazard detection | OpenCV Otsu (default): Gaussian blur → threshold → morphological opening. Optionally a trained SmallUNet (PyTorch) when `unet_weights.pth` is present, with an automatic fallback to Otsu on a missing/undertrained model |
+| **F2** | Ice hazard detection | OpenCV Otsu (default): Gaussian blur → threshold → morphological opening. Optionally a trained SmallUNet (PyTorch, architecture matched to `sea-ice-segmentation-u-net.ipynb`) when `models/unet_weights.pth` is present, with an automatic fallback to Otsu on a missing/undertrained model |
 | **F3** | Risk grid | 40×40 cells, 0–10 risk, iceberg positions stamped as hard hazards |
 | **F4** | 24-h drift prediction | Vector kinematics — current + 3% wind forcing |
 | **F5** | Risk-aware routing | Modified 8-directional A*, green optimal vs. red direct baseline |
@@ -144,9 +144,14 @@ On Windows, `demo.bat` does both steps in one double-click.
 
 ### Demo flow
 
-1. **📡 Simulate Satellite Data Drop** — ingests CSVs, generates/loads SAR
-2. **🔍 Detect Ice Hazards** — shows source imagery beside the detected mask
-3. **🧭 Predict Drift + Generate Route** — drift arrows, both routes, live metrics
+1. **📡 Simulate Satellite Data Drop** — ingests CSVs; samples a random Antarctic
+   (south) row from `seaice.csv` (real NSIDC extent + date) and generates a
+   synthetic SAR patch whose ice density reflects that real historical extent
+2. **🔍 Detect Ice (U-Net / OpenCV Surrogate)** — shows source imagery beside
+   the detected mask
+3. **⚓ Compute Risk-Aware Route (Modified A\* + p(n))** — drift arrows, both
+   routes, live metrics, a human-in-the-loop caption, and a provenance
+   caption (data source, model architecture, active inference path)
 4. Expand **📋 Strict JSON** and scroll to **route history**
 
 ---
@@ -171,27 +176,69 @@ polarization, 40 m resolution, bbox [-68.0, 59.5, -67.0, 61.0]).
 
 ---
 
+## Physics-informed synthetic SAR
+
+When no real crop is present, the synthetic SAR patch isn't just random noise —
+its ice density is driven by a real historical measurement. Each **Simulate
+Satellite Data Drop** samples one random Antarctic (`hemisphere == 'south'`)
+row from `seaice.csv` (the NSIDC Sea Ice Index) and scales the generated
+ice-blob count to that row's real extent (2.0 M km² → sparse, 19.0 M km² →
+dense). The UI shows exactly which historical day drove the patch, e.g.
+`Context: 1990-10-20 | Extent: 18.0 M km² (NSIDC)`.
+
+## Notebook-synced SmallUNet + training pipeline
+
+`SmallUNet` in `engine.py` mirrors the architecture in
+`sea-ice-segmentation-u-net.ipynb` layer-for-layer: the same 4-level encoder
+(32→64→128→256 filters), 512-channel bottleneck, `Dropout(0.5)` after every
+pool/concat, and an upsample-then-conv decoder (not a transposed convolution)
+with skip connections — adapted to a single grayscale input channel and a
+single binary (ice/no-ice) output channel instead of the notebook's 3-channel
+RGB input and 8-class ice-concentration output.
+
+`train_unet.py` trains this exact class externally (Colab/Kaggle/CPU — it is
+never run by the app itself) using the same augmentation (random flips, ±5°
+rotation) and `ReduceLROnPlateau` schedule as the notebook, then only commits
+`models/unet_weights.pth` if the trained model clears the acceptance bar:
+Dice ≥ 0.60 **and** ≥ 0.05 better than the existing Otsu baseline, measured on
+the same held-out patches for both. Until that bar is cleared, Otsu remains
+the active path — the UI's provenance caption always says which one actually
+ran: `Active Path: U-Net` or `Active Path: Otsu`.
+
+---
+
 ## Project structure
 
 ```
 PolarNav-AI/
-├── engine.py              # All navigation logic - pure numpy/OpenCV/stdlib
-│   ├── grid_to_latlon()   #   grid <-> geographic conversion (clamped)
-│   ├── resolve_sar_path() #   real-SAR preference with synthetic fallback
-│   ├── detect_ice()       #   F2 - returns (original, mask, pixel_count, active_path)
-│   ├── build_risk_grid()  #   F3 - 0..10 risk field
-│   ├── predict_drift()    #   F4 - current + 3% wind
-│   ├── astar()            #   F5 - risk-weighted, None if unreachable
-│   ├── route_metrics()    #   F6 - guarded against divide-by-zero
-│   ├── save_route()       #   F7 - SQLite WAL, returns bool, never raises
-│   └── strict_json()      #   F9 - NCPOR vessel API contract
-├── app.py                 # Streamlit UI - rendering only, no algorithms
+├── engine.py                          # All navigation + optional ML logic
+│   ├── grid_to_latlon()               #   grid <-> geographic conversion (clamped)
+│   ├── resolve_sar_path()             #   real-SAR preference with synthetic fallback
+│   ├── load_seaice_south()            #   NSIDC seaice.csv, Antarctic rows only
+│   ├── sample_seaice_row()            #   picks one random real (date, extent) row
+│   ├── make_synthetic_sar()           #   optional target_extent -> ice-blob density
+│   ├── SmallUNet                      #   architecture matched to the reference notebook
+│   ├── detect_ice()                   #   F2 - returns (original, mask, pixel_count, active_path)
+│   ├── build_risk_grid()              #   F3 - 0..10 risk field, optional KMeans profiling
+│   ├── predict_drift()                #   F4 - current + 3% wind, optional Ridge model
+│   ├── astar()                        #   F5 - risk-weighted, None if unreachable
+│   ├── route_metrics()                #   F6 - guarded against divide-by-zero
+│   ├── save_route()                   #   F7 - SQLite WAL, returns bool, never raises
+│   └── strict_json()                  #   F9 - NCPOR vessel API contract
+├── app.py                             # Streamlit UI - rendering only, no algorithms
+├── train_unet.py                      # External SmallUNet training (Colab/Kaggle/CPU;
+│                                       #   not run by the app) -> models/unet_weights.pth
+├── sea-ice-segmentation-u-net.ipynb   # Reference notebook SmallUNet's architecture is synced to
+├── seaice.csv                         # NSIDC Sea Ice Index (drives synthetic SAR density)
+├── requirements.txt / setup_demo.bat  # Pinned deps + one-shot offline-prep install
 ├── data/
-│   ├── icebergs.csv       # id, lat, lon, mass_kt, freeboard_m
-│   ├── wind_current.csv   # lat, lon, u_wind, v_wind, u_current, v_current
-│   ├── coast.geojson      # Bundled coastline - inlined, never fetched
-│   └── sar_metadata.json  # Sentinel-1 acquisition parameters
-└── demo.bat               # One-click Windows launcher
+│   ├── icebergs.csv                  # id, lat, lon, mass_kt, freeboard_m
+│   ├── wind_current.csv              # lat, lon, u_wind, v_wind, u_current, v_current
+│   ├── coast.geojson                 # Bundled coastline - inlined, never fetched
+│   └── sar_metadata.json             # Sentinel-1 acquisition parameters
+├── models/                           # unet_weights.pth (created + committed only once a
+│                                      #   trained model clears the accuracy bar - absent now)
+└── demo.bat                          # One-click Windows launcher
 ```
 
 `engine.py` has **no Streamlit import** — the full pipeline is testable headless,
