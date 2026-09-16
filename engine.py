@@ -286,14 +286,59 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
 
 
 # ----------------------------------------------------------------------
+# ML core: Ridge drift model (optional). The physics formula below is the
+# permanent fallback — never removed, always reachable.
+DRIFT_MODEL_PATH = "drift_model.joblib"
+_drift_model_cache: Dict[str, Any] = {}
+
+
+def load_drift_model(model_path: str = DRIFT_MODEL_PATH):
+    """
+    Load a trained scikit-learn Ridge drift model. Returns None (never
+    raises) when scikit-learn/joblib isn't installed, the model file is
+    absent, or loading fails — callers must fall back to the physics
+    formula in predict_drift().
+    """
+    if joblib is None or not os.path.exists(model_path):
+        return None
+    if model_path in _drift_model_cache:
+        return _drift_model_cache[model_path]
+    try:
+        model = joblib.load(model_path)
+        _drift_model_cache[model_path] = model
+        return model
+    except Exception:
+        return None
+
+
+def _ridge_predict_drift(lat: float, lon: float, uc: float, vc: float,
+                          uw: float, vw: float, hours: float, model) -> Tuple[float, float]:
+    """Ridge model predicts (dlat, dlon) directly from the drift features."""
+    features = np.array([[uc, vc, uw, vw, hours]], dtype=np.float64)
+    dlat, dlon = model.predict(features)[0]
+    return lat + dlat, lon + dlon
+
+
+# ----------------------------------------------------------------------
 # 4. Predict drift due to current and wind (single point)
 def predict_drift(lat: float, lon: float, uc: float, vc: float,
-                   uw: float, vw: float, hours: float = 24.0) -> Tuple[float, float]:
+                   uw: float, vw: float, hours: float = 24.0,
+                   drift_model=None) -> Tuple[float, float]:
     """
     Compute new position after drifting with ocean current (uc,vc) and wind
-    (uw,vw). Current and wind in m/s. Displacement = (current + 0.03*wind)
-    * hours * 3600. Convert to lat/lon using 1° ~ 111 km.
+    (uw,vw). Current and wind in m/s.
+
+    If drift_model is given (a trained Ridge model, see load_drift_model),
+    tries it first; any failure falls through to the physics formula below
+    (displacement = (current + 0.03*wind) * hours * 3600, converted to
+    lat/lon using 1° ~ 111 km) — Ridge is never allowed to crash the demo.
     """
+    if drift_model is not None:
+        try:
+            return _ridge_predict_drift(lat, lon, uc, vc, uw, vw, hours, drift_model)
+        except Exception:
+            pass  # fall through to the physics formula
+
     u_total = uc + 0.03 * uw
     v_total = vc + 0.03 * vw
 
@@ -315,7 +360,7 @@ def predict_drift(lat: float, lon: float, uc: float, vc: float,
 # 4b. Batch drift prediction for the Streamlit UI
 def predict_iceberg_drift(icebergs_df: Optional[pd.DataFrame],
                            wind_df: Optional[pd.DataFrame],
-                           hours: float = 24.0) -> pd.DataFrame:
+                           hours: float = 24.0, use_ridge: bool = True) -> pd.DataFrame:
     """
     Vectorized-by-row wrapper around predict_drift() for a table of icebergs.
 
@@ -323,9 +368,12 @@ def predict_iceberg_drift(icebergs_df: Optional[pd.DataFrame],
     it is treated here as the net drift-driving field rather than splitting
     it into a separate current + wind (there's no second field to split).
 
-    Never raises: a missing/empty icebergs_df returns an empty frame with
-    pred_lat/pred_lon columns; a missing/empty wind_df falls back to zero
-    drift velocity (icebergs stay put) instead of crashing.
+    If use_ridge and a trained drift_model.joblib is available, every row
+    uses it (with a per-row fallback to the physics formula on failure — see
+    predict_drift). Never raises: a missing/empty icebergs_df returns an
+    empty frame with pred_lat/pred_lon columns; a missing/empty wind_df
+    falls back to zero drift velocity (icebergs stay put) instead of
+    crashing.
     """
     base_cols = ["id", "lat", "lon", "mass_kt", "freeboard_m"]
     if icebergs_df is None:
@@ -339,6 +387,8 @@ def predict_iceberg_drift(icebergs_df: Optional[pd.DataFrame],
 
     have_wind = (wind_df is not None and len(wind_df) > 0
                  and {'lat', 'lon', 'u_current', 'v_current', 'u_wind', 'v_wind'}.issubset(wind_df.columns))
+
+    drift_model = load_drift_model() if use_ridge else None
 
     pred_lats: List[Optional[float]] = []
     pred_lons: List[Optional[float]] = []
@@ -371,7 +421,7 @@ def predict_iceberg_drift(icebergs_df: Optional[pd.DataFrame],
                 if any(math.isnan(v) for v in (uc, vc, uw, vw)):
                     uc, vc, uw, vw = 0.0, 0.0, 0.0, 0.0
 
-        new_lat, new_lon = predict_drift(lat, lon, uc, vc, uw, vw, hours)
+        new_lat, new_lon = predict_drift(lat, lon, uc, vc, uw, vw, hours, drift_model=drift_model)
         pred_lats.append(new_lat)
         pred_lons.append(new_lon)
 
