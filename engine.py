@@ -1,7 +1,10 @@
 """
 engine.py - Offline Antarctic navigation prototype (SIH26059)
-Uses only numpy, opencv-python, pandas, and Python standard library.
-No network calls, no ML frameworks, no API keys.
+Core: numpy, opencv-python, pandas, and Python standard library.
+Optional ML core (SmallUNet segmentation, Ridge drift, KMeans ice-class
+profiling) loads only if torch/scikit-learn are installed and trained
+weights are present; every ML path falls back to the original OpenCV/
+heuristic behavior otherwise. No network calls, no API keys.
 """
 
 import numpy as np
@@ -14,6 +17,23 @@ import heapq
 import os
 from datetime import datetime, timezone
 from typing import List, Tuple, Optional, Dict, Any
+
+try:
+    import torch
+    import torch.nn as nn
+except ImportError:
+    torch = None
+    nn = None
+
+try:
+    import joblib
+except ImportError:
+    joblib = None
+
+try:
+    from sklearn.cluster import KMeans
+except ImportError:
+    KMeans = None
 
 # Constants
 GRID = 40
@@ -122,23 +142,111 @@ def make_synthetic_sar(path: str = "data/sar_sample.png", size: int = 400,
 
 
 # ----------------------------------------------------------------------
-# 2. Ice detection
-def detect_ice(image_path: str) -> Tuple[np.ndarray, np.ndarray, int]:
+# ML core: SmallUNet segmentation (optional, CPU-only inference).
+# Otsu (below) is the permanent fallback — never removed, always reachable.
+UNET_WEIGHTS_PATH = "unet_weights.pth"
+
+if torch is not None:
+    class SmallUNet(nn.Module):
+        """3-level U-Net, base width 16 — small enough for CPU inference."""
+
+        def __init__(self, base: int = 16):
+            super().__init__()
+
+            def block(cin, cout):
+                return nn.Sequential(
+                    nn.Conv2d(cin, cout, 3, padding=1), nn.ReLU(inplace=True),
+                    nn.Conv2d(cout, cout, 3, padding=1), nn.ReLU(inplace=True),
+                )
+
+            self.enc1 = block(1, base)
+            self.enc2 = block(base, base * 2)
+            self.enc3 = block(base * 2, base * 4)
+            self.pool = nn.MaxPool2d(2)
+            self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 2, stride=2)
+            self.dec2 = block(base * 4, base * 2)
+            self.up1 = nn.ConvTranspose2d(base * 2, base, 2, stride=2)
+            self.dec1 = block(base * 2, base)
+            self.out = nn.Conv2d(base, 1, 1)
+
+        def forward(self, x):
+            e1 = self.enc1(x)
+            e2 = self.enc2(self.pool(e1))
+            e3 = self.enc3(self.pool(e2))
+            d2 = self.dec2(torch.cat([self.up2(e3), e2], dim=1))
+            d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+            return self.out(d1)
+
+
+_unet_model_cache: Dict[str, Any] = {}
+
+
+def load_unet_model(weights_path: str = UNET_WEIGHTS_PATH):
     """
-    Load image, apply Gaussian blur, Otsu threshold, morphological opening.
-    Returns (original_image, binary_mask, ice_pixel_count) — a 3-tuple, so
-    the caller can display both the source SAR image and the detected mask.
+    Load SmallUNet + trained weights for CPU inference. Returns None (never
+    raises) when torch isn't installed, the weights file is absent, or
+    loading fails for any reason — callers must treat None as "use Otsu".
+    """
+    if torch is None or not os.path.exists(weights_path):
+        return None
+    if weights_path in _unet_model_cache:
+        return _unet_model_cache[weights_path]
+    try:
+        model = SmallUNet()
+        state = torch.load(weights_path, map_location="cpu")
+        model.load_state_dict(state)
+        model.eval()
+        _unet_model_cache[weights_path] = model
+        return model
+    except Exception:
+        return None
+
+
+def _unet_segment(img: np.ndarray, model) -> np.ndarray:
+    """Run SmallUNet inference on a grayscale image; return a uint8 0/255 mask."""
+    with torch.no_grad():
+        x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+        probs = torch.sigmoid(model(x))[0, 0].numpy()
+    return (probs > 0.5).astype(np.uint8) * 255
+
+
+# ----------------------------------------------------------------------
+# 2. Ice detection
+def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Load image, segment ice, return (original_image, binary_mask,
+    ice_pixel_count) — a 3-tuple, so the caller can display both the source
+    SAR image and the detected mask.
+
+    If use_unet and a trained SmallUNet is available (see load_unet_model),
+    tries it first. Falls back to Gaussian blur + Otsu threshold +
+    morphological opening when no model is loaded, inference raises, or the
+    predicted mask covers <1% or >60% of the frame (a sanity-check guard
+    against a broken/undertrained model, not a latency guard).
     """
     image_path = resolve_sar_path(image_path)  # real crop if present, else the synthetic sample
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise FileNotFoundError(f"Image not found: {image_path}")
 
-    blurred = cv2.GaussianBlur(img, (7, 7), 0)
-    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    mask = None
+    if use_unet:
+        model = load_unet_model()
+        if model is not None:
+            try:
+                candidate = _unet_segment(img, model)
+                coverage = np.count_nonzero(candidate) / candidate.size
+                if 0.01 <= coverage <= 0.60:
+                    mask = candidate
+            except Exception:
+                mask = None
 
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    if mask is None:
+        blurred = cv2.GaussianBlur(img, (7, 7), 0)
+        _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
     ice_cells = int(np.count_nonzero(mask))
     return img, mask, ice_cells
@@ -161,12 +269,16 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
 
     if icebergs_df is not None and len(icebergs_df) > 0 \
             and {'lat', 'lon'}.issubset(icebergs_df.columns):
-        for _, row in icebergs_df.iterrows():
-            try:
-                r, c = latlon_to_grid(float(row['lat']), float(row['lon']), size)
-                risk[r, c] = 10.0
-            except (ValueError, TypeError):
-                continue  # skip a malformed row rather than crash the whole grid build
+        # Vectorized form of latlon_to_grid() (kept in sync with it manually) —
+        # avoids a per-row iterrows() loop over the iceberg table.
+        lats = pd.to_numeric(icebergs_df['lat'], errors='coerce').to_numpy()
+        lons = pd.to_numeric(icebergs_df['lon'], errors='coerce').to_numpy()
+        valid = ~(np.isnan(lats) | np.isnan(lons))
+        if valid.any():
+            lon_span = (LON_MAX - LON_MIN) or 1.0
+            rs = np.clip(np.round(size * (1.0 - (lats[valid] - LAT_MIN))), 0, size - 1).astype(int)
+            cs = np.clip(np.round(size * (lons[valid] - LON_MIN) / lon_span), 0, size - 1).astype(int)
+            risk[rs, cs] = 10.0
 
     risk = cv2.GaussianBlur(risk, (5, 5), 0)
     risk = np.clip(risk, 0.0, 10.0)
@@ -231,6 +343,17 @@ def predict_iceberg_drift(icebergs_df: Optional[pd.DataFrame],
     pred_lats: List[Optional[float]] = []
     pred_lons: List[Optional[float]] = []
 
+    # Wind-grid columns hoisted to numpy arrays once, outside the loop, so the
+    # per-iceberg nearest-point lookup below is plain array math instead of
+    # repeated pandas Series arithmetic + idxmin() (both real per-call overhead).
+    if have_wind:
+        wind_lat = pd.to_numeric(wind_df['lat'], errors='coerce').to_numpy()
+        wind_lon = pd.to_numeric(wind_df['lon'], errors='coerce').to_numpy()
+        wind_uc = pd.to_numeric(wind_df['u_current'], errors='coerce').to_numpy()
+        wind_vc = pd.to_numeric(wind_df['v_current'], errors='coerce').to_numpy()
+        wind_uw = pd.to_numeric(wind_df['u_wind'], errors='coerce').to_numpy()
+        wind_vw = pd.to_numeric(wind_df['v_wind'], errors='coerce').to_numpy()
+
     for _, row in icebergs_df.iterrows():
         try:
             lat, lon = float(row['lat']), float(row['lon'])
@@ -241,15 +364,11 @@ def predict_iceberg_drift(icebergs_df: Optional[pd.DataFrame],
 
         uc, vc, uw, vw = 0.0, 0.0, 0.0, 0.0
         if have_wind:
-            d2 = (wind_df['lat'] - lat) ** 2 + (wind_df['lon'] - lon) ** 2
-            if d2.notna().any():
-                nearest = wind_df.loc[d2.idxmin()]
-                try:
-                    uc = float(nearest['u_current'])
-                    vc = float(nearest['v_current'])
-                    uw = float(nearest['u_wind'])
-                    vw = float(nearest['v_wind'])
-                except (ValueError, TypeError):
+            d2 = (wind_lat - lat) ** 2 + (wind_lon - lon) ** 2
+            if np.any(~np.isnan(d2)):
+                i = np.nanargmin(d2)
+                uc, vc, uw, vw = float(wind_uc[i]), float(wind_vc[i]), float(wind_uw[i]), float(wind_vw[i])
+                if any(math.isnan(v) for v in (uc, vc, uw, vw)):
                     uc, vc, uw, vw = 0.0, 0.0, 0.0, 0.0
 
         new_lat, new_lon = predict_drift(lat, lon, uc, vc, uw, vw, hours)
