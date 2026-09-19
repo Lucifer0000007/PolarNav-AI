@@ -21,6 +21,14 @@ from engine import (
 # -----------------------------------------------------------------------------
 st.set_page_config(layout="wide", page_title="🧊 PolarNav AI")
 
+# F8 offline map: streamlit-folium loads Leaflet from folium's default CDN
+# links, so with Wi-Fi off the map never appears. Point the Map class at the
+# vendored copies in ./static (served by Streamlit itself via
+# server.enableStaticServing in .streamlit/config.toml). jQuery/Bootstrap/
+# awesome-markers are dropped: nothing on this map uses them.
+folium.Map.default_js = [("leaflet", "/app/static/leaflet.js")]
+folium.Map.default_css = [("leaflet_css", "/app/static/leaflet.css")]
+
 st.title("🧊 PolarNav AI — Edge-Native Antarctic Decision Support")
 
 # Sidebar — the toggle's value is now actually used (see map tiles below)

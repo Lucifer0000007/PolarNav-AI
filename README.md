@@ -42,7 +42,7 @@ machine.
 | **F5** | Risk-aware routing | Modified 8-directional A*, green optimal vs. red direct baseline |
 | **F6** | Live metrics | Distance, risk score, ice crossings, risk reduction %, fuel penalty %; current vs 24-h predicted exposure; display-only **Live Alerts** (per-iceberg CPA → HIGH/MED/LOW, reroute suggestion as text only) |
 | **F7** | Route history | Local SQLite (WAL mode), persists with no server |
-| **F8** | Fully offline | No sockets, no keys, no CDN — tiles=None basemap |
+| **F8** | Fully offline | No sockets, no keys, no CDN — tiles=None basemap; Leaflet 1.9.3 vendored in `static/` and served by Streamlit itself (`server.enableStaticServing`), so the map renders with Wi-Fi off |
 | **F9** | Vessel API output | Strict JSON payload for NCPOR shipboard systems |
 
 ---
@@ -241,6 +241,7 @@ PolarNav-AI/
 ├── sea-ice-segmentation-u-net.ipynb   # Reference notebook SmallUNet's architecture is synced to
 ├── seaice.csv                         # NSIDC Sea Ice Index (drives synthetic SAR density)
 ├── requirements.txt / setup_demo.bat  # Pinned deps + one-shot offline-prep install
+├── static/                            # Vendored leaflet.js + leaflet.css (offline map, no CDN)
 ├── data/
 │   ├── icebergs.csv                  # id, lat, lon, mass_kt, freeboard_m
 │   ├── wind_current.csv              # lat, lon, u_wind, v_wind, u_current, v_current

@@ -1,0 +1,61 @@
+{
+  "out_of_order": "PASS (both guard warnings shown, no exception)",
+  "exceptions_after_out_of_order": 0,
+  "f2_caption": "Active model: OpenCV Otsu (fallback)",
+  "map_t2s": {
+    "iframes": 1,
+    "leaflet_containers": 1,
+    "image_overlays": 1
+  },
+  "map_t8s": {
+    "iframes": 1,
+    "leaflet_containers": 1,
+    "image_overlays": 1
+  },
+  "metrics_default": {
+    "Ice cells": "10359",
+    "Risk Exposure": "0.25",
+    "Distance (km)": "157.1",
+    "Ice Crossings": "1",
+    "Risk Reduction %": "82.7",
+    "Fuel/Time Trade-off": "33.5%"
+  },
+  "alerts_default": [
+    "Server: OPERATIONAL",
+    "✅\n\ndata/icebergs.csv ingested successfully.",
+    "✅\n\ndata/wind_current.csv ingested successfully.",
+    "✅\n\nSAR imagery available at data/sar_sample.png.",
+    "Context: 1995-03-07 | Extent: 3.9 M km² (NSIDC)",
+    "HIGH: Iceberg 1 CPA 0.8 km — no lower-exposure alternative found",
+    "HIGH: Iceberg 3 CPA 0.8 km — no lower-exposure alternative found",
+    "HIGH: Iceberg 4 CPA 0.9 km — no lower-exposure alternative found",
+    "Predicted risk>5 cells on route: 1",
+    "🧑‍✈️\n\nHuman-in-the-loop: AI recommends the safest path, captain retains final authority."
+  ],
+  "has_live_alerts_header": true,
+  "has_horizon_caption": true,
+  "has_legend": true,
+  "has_strict_json_expander": true,
+  "strict_json_keys_ok": true,
+  "metrics_goal_20_20": {
+    "Ice cells": "10359",
+    "Risk Exposure": "0.76",
+    "Distance (km)": "58.9",
+    "Ice Crossings": "1",
+    "Risk Reduction %": "0.0",
+    "Fuel/Time Trade-off": "0.0%"
+  },
+  "alerts_goal_20_20": [
+    "Server: OPERATIONAL",
+    "✅\n\ndata/icebergs.csv ingested successfully.",
+    "✅\n\ndata/wind_current.csv ingested successfully.",
+    "✅\n\nSAR imagery available at data/sar_sample.png.",
+    "Context: 1995-03-07 | Extent: 3.9 M km² (NSIDC)",
+    "HIGH: Iceberg 1 CPA 0.3 km — no lower-exposure alternative found",
+    "Predicted risk>5 cells on route: 1",
+    "🧑‍✈️\n\nHuman-in-the-loop: AI recommends the safest path, captain retains final authority."
+  ],
+  "f6_metrics_differ": true,
+  "f7_history_after_refresh": true,
+  "external_requests": []
+}

@@ -1,3 +1,4 @@
 [server]
 fileWatcherType = "none"
 headless = true
+enableStaticServing = true   # serves ./static (vendored Leaflet) so the map renders with Wi-Fi off

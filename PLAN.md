@@ -153,3 +153,17 @@ Gate: `python engine.py` green (both exposures printed, assert passes, scenario 
 | Wi-Fi-OFF regression | `tiles=None` kept; overlay is base64 data-URI; network tab checked in Step F. |
 
 **Verification summary**: after every edit `python engine.py` (must pass); Step A `/qa` GO; Step D `/qa` GO + `/security-review` clean; Step E `git ls-files` clean; Step F 9/9 with Wi-Fi OFF.
+
+---
+
+## STATUS — 2026-09-19 (execution log)
+
+| Step | Result |
+|---|---|
+| Prep | `requirements.txt` committed, tag `finals-start` = e6e6fad |
+| A+B | DONE — commit acfcaa6. `python engine.py` green (current=predicted exposure 0.349, assert holds, scenario 71.7 % PASS). Playwright + AppTest: ordered / out-of-order / refresh / second goal all pass. |
+| B (U-Net) | NOT TRAINED — 0 patches. Otsu active, captions honest. `TRAINING_REPORT.md` §1. |
+| C (Ridge) | DONE — commit 2fedc0d. `train_drift.py` SYNTHETIC provenance, held-out R² 1.00 / RMSE 0.22 km, `models/drift_model.joblib` 1.1 KB tracked. Self-test prints `Drift source: ridge`. KMeans bands live. |
+| D | /qa GO (see `docs/training_evidence/qa_playwright_report.json`); security review clean — zero network clients, zero keys in the diff. |
+| F8 fix | Found during D: streamlit-folium pulled Leaflet from a CDN (pre-existing) → no map with Wi-Fi off. Fixed: Leaflet 1.9.3 vendored in `static/`, served via `server.enableStaticServing`; `folium.Map.default_js/css` pointed at it. Blocked-hosts Playwright run: map + overlay + polylines render, 0 external requests. |
+| torch | CPU wheel 2.14.0 install FAILED (`WinError 206` long path; `LongPathsEnabled=0`). Partial tree left in site-packages (removal was declined). `engine.py` import guard widened so the demo is unaffected. Optional for finals (no weights to load). |
