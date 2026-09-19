@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+from datetime import datetime, timezone
 import json
 
 # Offline navigation engine imports
@@ -66,6 +67,7 @@ _defaults = {
     "ice_error": None,
     "route_data": None,    # F5: plain data, never a folium.Map object
     "route_error": None,
+    "last_drop_at": None,  # M5: UTC datetime of the last successful F1 (live or static); drives the stale-drop banner
 }
 for _key, _val in _defaults.items():
     if _key not in st.session_state:
@@ -93,31 +95,62 @@ def _load_csv_safe(path: str, required_cols: set, empty_df: pd.DataFrame) -> pd.
 if st.button("📡 Simulate Satellite Data Drop"):
     os.makedirs("data", exist_ok=True)
 
-    st.session_state.icebergs_df = _load_csv_safe(
-        "data/icebergs.csv", REQUIRED_ICEBERG_COLS, _DEFAULT_ICEBERGS)
-    st.session_state.wind_df = _load_csv_safe(
-        "data/wind_current.csv", REQUIRED_WIND_COLS, _DEFAULT_WIND)
-
-    sar_path = "data/sar_sample.png"
+    # M1 (Realtime Core): prefer a live, validated satellite drop over the
+    # static data/ files when drop_watcher.py has produced one. Any failure
+    # anywhere in this check falls straight through to today's exact
+    # existing behavior — a live pipeline is additive, never required.
+    _live_receipt = None
     try:
-        # Physics-informed synthetic SAR: pick a random real Antarctic extent
-        # from the NSIDC Sea Ice Index and scale the ice-blob density to it,
-        # instead of an arbitrary fixed blob count. Regenerated every press so
-        # each data drop reflects a (possibly different) real historical day.
-        seaice_row = sample_seaice_row()
-        if seaice_row is not None:
-            make_synthetic_sar(sar_path, target_extent=seaice_row["extent"])
-        elif not os.path.exists(sar_path):
-            make_synthetic_sar(sar_path)  # seaice.csv unavailable — pinned default field
+        _receipt_path = os.path.join("drops_done", "latest_receipt.json")
+        if os.path.exists(_receipt_path):
+            with open(_receipt_path, encoding="utf-8") as _f:
+                _candidate = json.load(_f)
+            if all(os.path.exists(_candidate.get(_k, "")) for _k in ("sar_path", "icebergs_csv", "wind_csv")):
+                _live_receipt = _candidate
+    except Exception:
+        _live_receipt = None
+
+    if _live_receipt is not None:
+        st.session_state.icebergs_df = _load_csv_safe(
+            _live_receipt["icebergs_csv"], REQUIRED_ICEBERG_COLS, _DEFAULT_ICEBERGS)
+        st.session_state.wind_df = _load_csv_safe(
+            _live_receipt["wind_csv"], REQUIRED_WIND_COLS, _DEFAULT_WIND)
+    else:
+        st.session_state.icebergs_df = _load_csv_safe(
+            "data/icebergs.csv", REQUIRED_ICEBERG_COLS, _DEFAULT_ICEBERGS)
+        st.session_state.wind_df = _load_csv_safe(
+            "data/wind_current.csv", REQUIRED_WIND_COLS, _DEFAULT_WIND)
+
+    sar_path = _live_receipt["sar_path"] if _live_receipt is not None else "data/sar_sample.png"
+    try:
+        if _live_receipt is None:
+            # Physics-informed synthetic SAR: pick a random real Antarctic extent
+            # from the NSIDC Sea Ice Index and scale the ice-blob density to it,
+            # instead of an arbitrary fixed blob count. Regenerated every press so
+            # each data drop reflects a (possibly different) real historical day.
+            seaice_row = sample_seaice_row()
+            if seaice_row is not None:
+                make_synthetic_sar(sar_path, target_extent=seaice_row["extent"])
+            elif not os.path.exists(sar_path):
+                make_synthetic_sar(sar_path)  # seaice.csv unavailable — pinned default field
+        else:
+            seaice_row = None  # a live drop's SAR is the sim's own image, not NSIDC-extent-scaled synthetic
         st.session_state.seaice_context = seaice_row
 
         st.session_state.sat_data_loaded = True
         st.session_state.drop_error = None
-        st.session_state.drop_receipts = [
-            ("success", "✅ data/icebergs.csv ingested successfully."),
-            ("success", "✅ data/wind_current.csv ingested successfully."),
-            ("success", f"✅ SAR imagery available at {sar_path}."),
-        ]
+        st.session_state.last_drop_at = datetime.now(timezone.utc)
+        if _live_receipt is not None:
+            st.session_state.drop_receipts = [
+                ("success", f"📡 Live drop consumed: {_live_receipt['batch_id']} "
+                            f"(validated {_live_receipt['validated_at']})"),
+            ]
+        else:
+            st.session_state.drop_receipts = [
+                ("success", "✅ data/icebergs.csv ingested successfully."),
+                ("success", "✅ data/wind_current.csv ingested successfully."),
+                ("success", f"✅ SAR imagery available at {sar_path}."),
+            ]
         if seaice_row is not None:
             st.session_state.drop_receipts.append(
                 ("info", f"Context: {seaice_row['year']:04d}-{seaice_row['month']:02d}-"
@@ -126,10 +159,12 @@ if st.button("📡 Simulate Satellite Data Drop"):
         # than silently planning around zero icebergs.
         if st.session_state.icebergs_df.empty:
             st.session_state.drop_receipts.append(
-                ("info", "data/icebergs.csv unavailable — using empty iceberg defaults."))
+                ("info", f"{'live iceberg data' if _live_receipt else 'data/icebergs.csv'} "
+                         f"unavailable — using empty iceberg defaults."))
         if st.session_state.wind_df.empty:
             st.session_state.drop_receipts.append(
-                ("info", "data/wind_current.csv unavailable — using empty wind/current defaults."))
+                ("info", f"{'live wind/current data' if _live_receipt else 'data/wind_current.csv'} "
+                         f"unavailable — using empty wind/current defaults."))
     except Exception as e:
         st.session_state.sat_data_loaded = False
         st.session_state.drop_receipts = []

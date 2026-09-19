@@ -10,3 +10,7 @@ CLAUDE.md
 models/*.pth
 .ml-venv/
 routes_out/
+drops_in/
+drops_done/
+drops_quarantine/
+events.log
