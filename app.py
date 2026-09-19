@@ -2,6 +2,7 @@ import os
 import hashlib
 import math
 import socket
+import time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -21,6 +22,68 @@ from engine import (
     cpa_km, classify_threat, suggest_reroute,
     GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
 )
+
+# ---- M2: NMEA live position (loopback probe only; unreachable -> pinned, never raises) ----
+# Defined this early (before the sidebar/M4 status block below) so both the
+# M4 Production Mimic dot and the position-badge fragment further down can
+# call _nmea_probe() -- a plain top-level def's globals are resolved at call
+# time, so a call site earlier in the file than the def would NameError on
+# the script's very first pass.
+def _dm_to_decimal(dm_str: str, hemi: str) -> float:
+    """NMEA ddmm.mmmm / dddmm.mmmm -> decimal degrees. The last 2 integer
+    digits before the decimal point are always minutes, regardless of
+    whether the degree part is 2 digits (lat) or 3 (lon) -- verified by
+    round-tripping nmea_sim.py's own sentence builder against this."""
+    dot = dm_str.index(".")
+    deg = int(dm_str[:dot - 2])
+    minutes = float(dm_str[dot - 2:])
+    dec = deg + minutes / 60.0
+    return -dec if hemi in ("S", "W") else dec
+
+
+def _parse_nmea_line(line: str):
+    """One GPGGA/RMC sentence -> (lat, lon), or None. Tries pynmea2 first
+    if importable, else the stdlib fallback above -- verified to agree
+    with pynmea2 on the same sentences before being relied on here."""
+    line = line.strip()
+    if not line.startswith("$") or "*" not in line:
+        return None
+    try:
+        import pynmea2
+        msg = pynmea2.parse(line)
+        return float(msg.latitude), float(msg.longitude)
+    except Exception:
+        pass
+    try:
+        body = line.split("*")[0][1:]
+        fields = body.split(",")
+        sid = fields[0]
+        if sid.endswith("GGA"):
+            return _dm_to_decimal(fields[2], fields[3]), _dm_to_decimal(fields[4], fields[5])
+        if sid.endswith("RMC"):
+            return _dm_to_decimal(fields[3], fields[4]), _dm_to_decimal(fields[5], fields[6])
+    except Exception:
+        pass
+    return None
+
+
+def _nmea_probe():
+    """0.2s loopback-only connect probe; reads one sentence. Returns
+    (lat, lon) or None. Never raises -- nmea_sim.py absence is a normal,
+    fully-supported state, not an error."""
+    try:
+        with socket.create_connection(("127.0.0.1", 10110), timeout=0.2) as s:
+            s.settimeout(1.0)
+            buf = b""
+            while b"\n" not in buf and len(buf) < 1024:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                buf += chunk
+        return _parse_nmea_line(buf.split(b"\n")[0].decode("ascii", errors="ignore"))
+    except Exception:
+        return None
+
 
 # -----------------------------------------------------------------------------
 # Configuration & Layout
@@ -44,6 +107,56 @@ st.info("Model status: Otsu is active for ice detection (U-Net exists but hasn't
 offline_mode = st.sidebar.toggle("Edge-Native Mode (Offline)", value=True)
 st.sidebar.caption("Connectivity: OUTAGE SIMULATED" if offline_mode else "Connectivity: ONLINE")
 st.sidebar.success("Server: OPERATIONAL")
+
+# ---- M4: Production Mimic status page. Pure reads, no side effects -- ----
+# each of the 4 checks is independently wrapped so one failing can never
+# take down the other 3 or the page itself.
+with st.sidebar.expander("🛰 Production Mimic"):
+    st.code(
+        "satcom_sim -> drops_in/ -> drop_watcher -> drops_done/ (or drops_quarantine/)\n"
+        "                                   |\n"
+        "nmea_sim -----------------> app <--+--> bus -> kafka (if reachable)\n"
+        "                                          `--> events.log (always)",
+        language=None,
+    )
+
+    @st.fragment(run_every="2s")
+    def _production_mimic_status():
+        try:
+            receipt_path = os.path.join("drops_done", "latest_receipt.json")
+            age_s = time.time() - os.path.getmtime(receipt_path) if os.path.exists(receipt_path) else None
+            if age_s is not None and age_s < 60:
+                st.success(f"Watcher: fresh ({age_s:.0f}s ago)")
+            else:
+                st.info("Watcher: no recent validated drop")
+        except Exception:
+            st.info("Watcher: unknown")
+
+        try:
+            mode = bus.transport_mode()
+            if mode == "kafka":
+                st.success(f"Bus: {mode}")
+            else:
+                st.info(f"Bus: {mode}")
+        except Exception:
+            st.info("Bus: unknown")
+
+        try:
+            if _nmea_probe() is not None:
+                st.success("NMEA: live")
+            else:
+                st.info("NMEA: pinned (no feed)")
+        except Exception:
+            st.info("NMEA: unknown")
+
+        try:
+            _iv = st.session_state.get("ice_view")
+            active = _iv["active_path"] if _iv else "not yet detected"
+            st.info(f"Model: {active}")
+        except Exception:
+            st.info("Model: unknown")
+
+    _production_mimic_status()
 
 # -----------------------------------------------------------------------------
 # Session State Initialization — every key any button reads is created up
@@ -371,63 +484,6 @@ def _compute_route(start_coord, goal_coord) -> bool:
     except Exception as e:
         st.session_state.route_error = f"Route generation failed: {e}"
         return False
-
-
-# ---- M2: NMEA live position (loopback probe only; unreachable -> pinned, never raises) ----
-def _dm_to_decimal(dm_str: str, hemi: str) -> float:
-    """NMEA ddmm.mmmm / dddmm.mmmm -> decimal degrees. The last 2 integer
-    digits before the decimal point are always minutes, regardless of
-    whether the degree part is 2 digits (lat) or 3 (lon) -- verified by
-    round-tripping nmea_sim.py's own sentence builder against this."""
-    dot = dm_str.index(".")
-    deg = int(dm_str[:dot - 2])
-    minutes = float(dm_str[dot - 2:])
-    dec = deg + minutes / 60.0
-    return -dec if hemi in ("S", "W") else dec
-
-
-def _parse_nmea_line(line: str):
-    """One GPGGA/RMC sentence -> (lat, lon), or None. Tries pynmea2 first
-    if importable, else the stdlib fallback above -- verified to agree
-    with pynmea2 on the same sentences before being relied on here."""
-    line = line.strip()
-    if not line.startswith("$") or "*" not in line:
-        return None
-    try:
-        import pynmea2
-        msg = pynmea2.parse(line)
-        return float(msg.latitude), float(msg.longitude)
-    except Exception:
-        pass
-    try:
-        body = line.split("*")[0][1:]
-        fields = body.split(",")
-        sid = fields[0]
-        if sid.endswith("GGA"):
-            return _dm_to_decimal(fields[2], fields[3]), _dm_to_decimal(fields[4], fields[5])
-        if sid.endswith("RMC"):
-            return _dm_to_decimal(fields[3], fields[4]), _dm_to_decimal(fields[5], fields[6])
-    except Exception:
-        pass
-    return None
-
-
-def _nmea_probe():
-    """0.2s loopback-only connect probe; reads one sentence. Returns
-    (lat, lon) or None. Never raises -- nmea_sim.py absence is a normal,
-    fully-supported state, not an error."""
-    try:
-        with socket.create_connection(("127.0.0.1", 10110), timeout=0.2) as s:
-            s.settimeout(1.0)
-            buf = b""
-            while b"\n" not in buf and len(buf) < 1024:
-                chunk = s.recv(256)
-                if not chunk:
-                    break
-                buf += chunk
-        return _parse_nmea_line(buf.split(b"\n")[0].decode("ascii", errors="ignore"))
-    except Exception:
-        return None
 
 
 def _km_between(ll1, ll2) -> float:
