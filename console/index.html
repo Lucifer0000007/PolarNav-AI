@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PolarNav AI — Edge Navigation Console</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-title">
+    <span class="ice">&#10052;</span> POLARNAV AI <span class="sep">&middot;</span> EDGE NAVIGATION CONSOLE
+  </div>
+  <div class="topbar-right">
+    <span class="badge badge-ok" id="edge-native-badge">EDGE-NATIVE</span>
+    <span class="clock" id="utc-clock">--:--:--Z</span>
+  </div>
+</header>
+
+<div id="stale-banner" class="banner banner-warn" hidden></div>
+
+<main>
+  <section class="kpi-row" aria-label="Route KPIs">
+    <div class="kpi-card">
+      <div class="kpi-label">RISK REDUCTION</div>
+      <div class="kpi-value" id="kpi-risk-reduction">&mdash;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">DISTANCE COST</div>
+      <div class="kpi-value" id="kpi-distance">&mdash;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">MIN CPA</div>
+      <div class="kpi-value" id="kpi-cpa">&mdash;</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label">ACTIVE MODEL</div>
+      <div class="kpi-value kpi-value-text" id="kpi-model">&mdash;</div>
+    </div>
+  </section>
+
+  <section class="controls" aria-label="Voyage controls">
+    <button id="btn-detect" class="btn btn-accent">&#128225; Ingest &amp; Detect</button>
+    <span id="detect-caption" class="caption"></span>
+
+    <label class="control-label" for="sel-start">Start</label>
+    <select id="sel-start" class="select"></select>
+    <label class="control-label" for="sel-goal">Goal</label>
+    <select id="sel-goal" class="select"></select>
+    <button id="btn-route" class="btn btn-accent">&#8987; Compute Route</button>
+
+    <span id="pos-badge" class="badge badge-dim">PINNED</span>
+  </section>
+
+  <section class="ticker-wrap" aria-label="Event stream">
+    <div class="ticker-label">EVENT STREAM</div>
+    <div class="ticker" id="ticker"><span class="ticker-track" id="ticker-track">waiting for events&hellip;</span></div>
+  </section>
+
+  <section class="main-grid">
+    <div class="panel map-panel">
+      <div class="panel-title">NAVIGATION MAP</div>
+      <iframe id="map-frame" src="/map" title="Navigation map"></iframe>
+    </div>
+
+    <div class="panel side-panel">
+      <div class="panel-title">SYSTEM TOPOLOGY</div>
+      <svg id="topology" viewBox="0 0 320 150" class="topology-svg">
+        <line x1="30" y1="30" x2="120" y2="30" class="topo-edge"/>
+        <line x1="120" y1="30" x2="120" y2="75" class="topo-edge"/>
+        <line x1="30" y1="120" x2="120" y2="75" class="topo-edge"/>
+        <line x1="120" y1="75" x2="210" y2="75" class="topo-edge"/>
+        <line x1="210" y1="75" x2="290" y2="40" class="topo-edge"/>
+        <line x1="210" y1="75" x2="290" y2="110" class="topo-edge"/>
+
+        <circle cx="30" cy="30" r="8" class="topo-dot" id="dot-satcom"/>
+        <text x="30" y="16" class="topo-label">satcom</text>
+        <circle cx="120" cy="75" r="8" class="topo-dot" id="dot-watcher"/>
+        <text x="120" y="61" class="topo-label">watcher</text>
+        <circle cx="30" cy="120" r="8" class="topo-dot" id="dot-nmea"/>
+        <text x="30" y="140" class="topo-label">nmea</text>
+        <circle cx="210" cy="75" r="8" class="topo-dot" id="dot-app"/>
+        <text x="210" y="61" class="topo-label">app</text>
+        <circle cx="290" cy="40" r="8" class="topo-dot" id="dot-bus"/>
+        <text x="278" y="26" class="topo-label">bus</text>
+        <circle cx="290" cy="110" r="8" class="topo-dot" id="dot-model"/>
+        <text x="270" y="130" class="topo-label">model</text>
+      </svg>
+
+      <div class="panel-title">LIVE ALERTS</div>
+      <div id="alerts" class="alerts">no route computed yet.</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">ROUTE HISTORY</div>
+    <div class="table-wrap">
+      <table id="history-table">
+        <thead><tr><th>ts</th><th>start</th><th>goal</th><th>distance_km</th><th>risk_red</th></tr></thead>
+        <tbody id="history-body"><tr><td colspan="5">no routes yet.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-title">
+      STRICT JSON (vessel-API-ready payload schema)
+      <button id="btn-copy-json" class="btn btn-small">Copy</button>
+    </div>
+    <pre id="json-viewer" class="json-viewer">no route computed yet.</pre>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>

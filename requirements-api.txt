@@ -1,0 +1,9 @@
+# PolarNav AI - Bridge Console API deps (additive, separate from requirements.txt)
+# requirements.txt stays frozen -- these three packages exist only to run
+# api.py + console.bat, never imported by engine.py/app.py/demo.bat.
+# uvicorn/pydantic are pinned to what's already present in this environment
+# (as transitive deps of unrelated tools) rather than upgraded, so installing
+# this file only actually adds fastapi and leaves everything else untouched.
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.4
