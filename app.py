@@ -1,4 +1,5 @@
 import os
+import hashlib
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -445,7 +446,7 @@ if routes:
 else:
     st.info("No route history found locally.")
 
-with st.expander("📋 Strict JSON (NCPOR vessel API)"):
+with st.expander("📋 Strict JSON — vessel-API-ready payload schema (transport = Phase 2)"):
     if _rd is not None:
         json_output = strict_json(
             _rd["start_ll"],
@@ -454,6 +455,21 @@ with st.expander("📋 Strict JSON (NCPOR vessel API)"):
             _rd["metrics"],
             _rd["drift_list"],
         )
-        st.code(json.dumps(json_output, indent=2), language="json")
+        payload_str = json.dumps(json_output, indent=2)
+        st.code(payload_str, language="json")
+
+        # F5: file-drop so the payload is inspectable outside the browser too.
+        # sha256 is computed over the payload alone (before the field is added)
+        # so the checksum isn't self-referential.
+        export_dir = "routes_out"
+        export_path = os.path.join(export_dir, "latest.json")
+        checksum = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+        try:
+            os.makedirs(export_dir, exist_ok=True)
+            with open(export_path, "w", encoding="utf-8") as f:
+                json.dump({**json_output, "sha256": checksum}, f, indent=2)
+            st.caption(f"Exported to `{export_path}` · sha256 `{checksum[:12]}…`")
+        except OSError as e:
+            st.caption(f"Export to {export_path} failed: {e}")
     else:
         st.write("Generate a route to preview the API payload.")

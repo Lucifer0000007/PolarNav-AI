@@ -9,3 +9,4 @@ data/sar_sample.png
 CLAUDE.md
 models/*.pth
 .ml-venv/
+routes_out/

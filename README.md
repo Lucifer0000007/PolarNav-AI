@@ -43,7 +43,7 @@ machine.
 | **F6** | Live metrics | Distance, risk score, ice crossings, risk reduction %, fuel penalty %; current vs 24-h predicted exposure; display-only **Live Alerts** (per-iceberg CPA → HIGH/MED/LOW, reroute suggestion as text only) |
 | **F7** | Route history | Local SQLite (WAL mode), persists with no server |
 | **F8** | Fully offline | No sockets, no keys, no CDN — tiles=None basemap; Leaflet 1.9.3 vendored in `static/` and served by Streamlit itself (`server.enableStaticServing`), so the map renders with Wi-Fi off |
-| **F9** | Vessel API output | Strict JSON payload for NCPOR shipboard systems |
+| **F9** | Vessel-API-ready schema | Strict JSON payload structured for NCPOR shipboard systems (transport = Phase 2) |
 
 ---
 
@@ -231,7 +231,7 @@ PolarNav-AI/
 │   ├── cpa_km() / classify_threat()   #   F6 - closest point of approach -> HIGH/MED/LOW
 │   ├── suggest_reroute()              #   F6 - 2x-penalty A* offered as text, never auto-applied
 │   ├── save_route()                   #   F7 - SQLite WAL, returns bool, never raises
-│   └── strict_json()                  #   F9 - NCPOR vessel API contract
+│   └── strict_json()                  #   F9 - vessel-API-ready payload schema (transport = Phase 2)
 ├── app.py                             # Streamlit UI - rendering only, no algorithms
 ├── train_unet.py                      # External SmallUNet training (Colab/Kaggle/CPU;
 │                                       #   not run by the app) -> models/unet_weights.pth
@@ -258,7 +258,7 @@ which is why the self-test can gate every change.
 
 ---
 
-## Vessel API contract (F9)
+## Vessel-API-ready payload schema (F9, transport = Phase 2)
 
 `strict_json()` returns exactly these keys, ready for a shipboard system:
 
