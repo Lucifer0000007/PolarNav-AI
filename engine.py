@@ -888,8 +888,16 @@ def cpa_km(route_latlon: List[Any], track_latlon: List[Any], samples: int = 25) 
 
 
 def classify_threat(cpa: float, predicted_crossings: int) -> str:
-    """HIGH if CPA < 5 km or the route crosses predicted risk>5 cells; MED if CPA < 10 km; else LOW."""
-    if cpa < 5.0 or predicted_crossings > 0:
+    """
+    Proximity-only threat class: HIGH if CPA < 5 km, MED if CPA < 10 km,
+    else LOW. predicted_crossings no longer forces HIGH on its own — a route
+    crossing predicted risk>5 cells is a real hazard, but a distinct one
+    from a specific nearby iceberg, and callers should surface it as its own
+    advisory line rather than have it silently escalate proximity here.
+    predicted_crossings is kept as a parameter (existing call sites already
+    pass a real value) but no longer affects the return.
+    """
+    if cpa < 5.0:
         return "HIGH"
     if cpa < 10.0:
         return "MED"
@@ -1128,6 +1136,14 @@ if __name__ == "__main__":
     min_cpa = min(cpas.values()) if cpas else _INF
     threat = classify_threat(min_cpa, metrics['predicted_crossings'])
     print(f"CPA per iceberg (km): {cpas} -> threat {threat}")
+    # F3: a predicted crossing must never force HIGH by itself -- only real
+    # proximity (CPA < 5 km) can. This sample's closest iceberg is >=10 km
+    # away even though predicted_crossings > 0, so threat must not be HIGH.
+    if metrics['predicted_crossings'] > 0 and min_cpa >= 5.0:
+        assert threat != "HIGH", \
+            f"predicted_crossings alone must not force HIGH (min_cpa={min_cpa:.2f} km, threat={threat})"
+        print(f"  F3 check OK: predicted_crossings={metrics['predicted_crossings']} > 0 "
+              f"but min_cpa={min_cpa:.2f} km keeps threat at '{threat}', not HIGH")
     reroute = suggest_reroute(risk_combined, start, goal, astar_path, risk_pred) if threat == "HIGH" else None
     print(f"Reroute suggestion: {('+%.1f km' % reroute[1]) if reroute else 'none'}")
 

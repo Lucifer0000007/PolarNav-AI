@@ -257,15 +257,17 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
             # Compute metrics (risk_grid first — matches route_metrics' real signature)
             metrics = route_metrics(risk_grid, opt_path, dir_path, predicted_grid=risk_pred)
 
-            # Live alerts (display-only): per-iceberg CPA against its 24-h track,
-            # route-level threat from the closest one + predicted crossings. A
-            # HIGH threat asks for a reroute SUGGESTION — the shown route never
-            # auto-switches; the captain decides.
+            # Live alerts (display-only): per-iceberg CPA against its 24-h track
+            # drives proximity threat (HIGH/MED/LOW, CPA-only per F3); predicted
+            # risk>5 crossings is a SEPARATE, independent advisory line — it
+            # never escalates a distant iceberg to HIGH by itself. A HIGH
+            # proximity threat asks for a reroute SUGGESTION — the shown route
+            # never auto-switches; the captain decides.
             route_ll = [grid_to_latlon(r, c) for r, c in opt_path]
             cpas = [(ib_id, cpa_km(route_ll, [curr_loc, pred_loc])) for ib_id, curr_loc, pred_loc in tracks]
             min_cpa = min((c for _, c in cpas), default=float('inf'))
             pred_x = metrics['predicted_crossings']
-            threat = classify_threat(min_cpa, pred_x)
+            threat = classify_threat(min_cpa, 0)  # proximity-only; predicted_crossings no longer affects this
             reroute = suggest_reroute(risk_combined, start_coord, goal_coord,
                                       opt_path, risk_pred) if threat == "HIGH" else None
             suggestion = (f"alternate route suggested (+{reroute[1]:.1f} km)" if reroute
@@ -277,8 +279,8 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
                     alerts.append(("error", f"HIGH: Iceberg {ib_id} CPA {cpa:.1f} km — {suggestion}"))
                 elif lvl == "MED":
                     alerts.append(("warning", f"MED: route passes within {cpa:.1f} km of {ib_id} drift corridor"))
-            if threat == "HIGH" and pred_x > 0 and not any(k == "error" for k, _ in alerts):
-                alerts.append(("error", f"HIGH: route crosses {pred_x} predicted risk>5 cell(s) — {suggestion}"))
+            if pred_x > 0:
+                alerts.append(("warning", f"MED: Route crosses {pred_x} predicted risk>5 cells - expect icebreaking"))
             if not alerts:
                 alerts.append(("info", "LOW: corridor clear for 24 h"))
             alerts.append(("info", f"Predicted risk>5 cells on route: {pred_x}"))
