@@ -1,0 +1,66 @@
+{
+  "1_loads_offline": true,
+  "2_data_drop": {
+    "receipts_found": 3,
+    "context_line": "Context: 2014-11-24 | Extent: 15.4 M km² (NSIDC)"
+  },
+  "3_detect_ice": {
+    "images_shown": false,
+    "active_model_caption": "Active model: OpenCV Otsu (fallback)",
+    "ice_cells_metric": null
+  },
+  "4_route_defaults": {
+    "metrics": {
+      "Ice cells": "30220",
+      "Risk Exposure": "0.77",
+      "Distance (km)": "187.9",
+      "Ice Crossings": "4",
+      "Risk Reduction %": "80.5",
+      "Fuel/Time Trade-off": "59.6%"
+    },
+    "map_state": {
+      "leaflet": 1,
+      "overlay_img": 1,
+      "route_paths": 34
+    },
+    "green_and_red_paths_present": true
+  },
+  "5_overlay_and_legend": {
+    "overlay_image_in_dom": true,
+    "horizon_caption": true,
+    "legend_present": true
+  },
+  "6_live_alerts": {
+    "has_header": true,
+    "alert_count": 3,
+    "predicted_crossings_line": "Predicted risk>5 cells on route: 4",
+    "sample": [
+      "HIGH: Iceberg 1 CPA 0.7 km — alternate route suggested (+1.6 km)",
+      "HIGH: Iceberg 4 CPA 1.0 km — alternate route suggested (+1.6 km)",
+      "MED: route passes within 6.2 km of 3 drift corridor",
+      "Predicted risk>5 cells on route: 4"
+    ]
+  },
+  "7_f6_live_on_new_goal": {
+    "metrics_goal_20_20": {
+      "Ice cells": "30220",
+      "Risk Exposure": "0.71",
+      "Distance (km)": "96.4",
+      "Ice Crossings": "2",
+      "Risk Reduction %": "69.3",
+      "Fuel/Time Trade-off": "63.7%"
+    },
+    "metrics_differ_from_default": true,
+    "alerts_differ_from_default": true
+  },
+  "8_refresh_f7_persists": {
+    "history_table_present": true
+  },
+  "9_strict_json": {
+    "all_keys_present": true,
+    "mode_offline": true,
+    "missing": []
+  },
+  "blocked_external_requests": [],
+  "total_exceptions_seen": 0
+}
