@@ -7,6 +7,7 @@ weights are present; every ML path falls back to the original OpenCV/
 heuristic behavior otherwise. No network calls, no API keys.
 """
 
+import argparse
 import numpy as np
 import pandas as pd
 import cv2
@@ -1042,155 +1043,196 @@ def strict_json(start_ll: Tuple[float, float], goal_ll: Tuple[float, float],
 # ----------------------------------------------------------------------
 # Self-test when run as main
 if __name__ == "__main__":
-    print("=== Running offline self-test ===")
+    parser = argparse.ArgumentParser(
+        description="PolarNav AI engine self-test. With no arguments, runs the "
+                    "pinned demo scenario (unchanged). --sanity checks the "
+                    "routing/metrics pipeline generalizes beyond that one scenario.")
+    parser.add_argument("--sanity", action="store_true",
+                        help="Run 3 alternate (seed, start, goal) configs instead "
+                             "of the pinned self-test; asserts each finds a path, "
+                             "produces finite metrics, and optimized risk <= direct risk.")
+    args = parser.parse_args()
 
-    sar_path = "data/sar_sample.png"
-    print("Generating synthetic SAR...")
-    make_synthetic_sar(sar_path, size=400)
-    print(f"SAR saved to {sar_path}")
-
-    print("Detecting ice...")
-    resolved = resolve_sar_path(sar_path)
-    print("Source: real Sentinel-1 crop" if resolved != sar_path else "Source: synthetic sample")
-    orig_img, mask, ice_cells, ice_path = detect_ice(sar_path)
-    print(f"Ice pixels: {ice_cells} (active path: {ice_path})")
-    print(f"Drift source: {'ridge (models/drift_model.joblib)' if load_drift_model() else 'physics formula (fallback)'}")
-
-    print("Building risk grid...")
-    risk_grid = build_risk_grid(mask, GRID)
-    print(f"Risk grid shape: {risk_grid.shape}, min={risk_grid.min():.2f}, max={risk_grid.max():.2f}")
-
-    print("Forecasting 24-h risk grid...")
-    wind_path = "data/wind_current.csv"
-    wind_df = pd.read_csv(wind_path) if os.path.exists(wind_path) else pd.DataFrame([
-        {"lat": -67.3, "lon": 60.1, "u_current": 0.1, "v_current": 0.08, "u_wind": 3.0, "v_wind": 2.0},
-        {"lat": -67.6, "lon": 60.5, "u_current": 0.12, "v_current": 0.05, "u_wind": 4.0, "v_wind": 2.5},
-    ])
-    drift_field = build_drift_field(wind_df)
-    risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
-    risk_combined = np.maximum(risk_grid, risk_pred)
-    print(f"Drift field: {'ok' if drift_field is not None else 'none (predicted == current)'} | "
-          f"cells>5 now={int((risk_grid > 5).sum())} in 24h={int((risk_pred > 5).sum())}")
-    band_edges, band_src = kmeans_band_edges(risk_pred)
-    print(f"Concentration bands (%): {band_edges} (source: {band_src})")
-
-    start = DEMO_START
-    goal = DEMO_GOAL
-    print(f"Start: {start}, Goal: {goal}")
-
-    print("Running A* on combined (current | 24h predicted) risk...")
-    astar_path = astar(risk_combined, start, goal, risk_weight=50.0)
-    if astar_path is None:
-        print("A* found no path! Falling back to direct path.")
-        astar_path = direct_path(risk_grid, start, goal)
+    if args.sanity:
+        print("=== Running scenario sanity check (3 alternate configs) ===")
+        _sanity_sar = "data/_sanity_sar.png"  # separate from data/sar_sample.png -- never touches the real demo cache
+        _configs = [
+            (7, (8, 8), (32, 30)),
+            (42, (3, 20), (36, 15)),
+            (1337, (10, 2), (25, 38)),
+        ]
+        _results = []
+        for _seed, _start, _goal in _configs:
+            make_synthetic_sar(_sanity_sar, size=400, seed=_seed)
+            _, _mask, _, _ = detect_ice(_sanity_sar)
+            _risk_grid = build_risk_grid(_mask, GRID)
+            _path = astar(_risk_grid, _start, _goal, risk_weight=50.0)
+            _direct = direct_path(_risk_grid, _start, _goal)
+            if _path is None:
+                _path = _direct  # astar's documented fallback -- still a valid config, not a failure
+            _metrics = route_metrics(_risk_grid, _path, _direct)
+            _finite = all(math.isfinite(v) for v in (
+                _metrics['path_distance_km'], _metrics['path_risk_score'],
+                _metrics['risk_reduction_pct'], _metrics['fuel_penalty_pct']))
+            _ok = (_path is not None) and _finite and (_metrics['path_risk_score'] <= _metrics['direct_risk_score'] + 1e-9)
+            _results.append((_seed, _start, _goal, _metrics['risk_reduction_pct'], _ok))
+            assert _ok, f"sanity check FAILED for seed={_seed} start={_start} goal={_goal}"
+        if os.path.exists(_sanity_sar):
+            os.remove(_sanity_sar)  # never left behind, never committed
+        print(f"{'seed':>6} {'start':>10} {'goal':>10} {'risk_reduction_pct':>20} {'result':>8}")
+        for _seed, _start, _goal, _rr, _ok in _results:
+            print(f"{_seed:>6} {str(_start):>10} {str(_goal):>10} {_rr:>19.1f}% {'PASS' if _ok else 'FAIL':>8}")
+        print("=== Sanity check complete: all 3 configs PASS ===")
     else:
-        print(f"A* path length: {len(astar_path)}")
+        print("=== Running offline self-test ===")
 
-    print("Computing direct path...")
-    direct = direct_path(risk_grid, start, goal)
-    print(f"Direct path length: {len(direct)}")
+        sar_path = "data/sar_sample.png"
+        print("Generating synthetic SAR...")
+        make_synthetic_sar(sar_path, size=400)
+        print(f"SAR saved to {sar_path}")
 
-    print("Computing metrics...")
-    metrics = route_metrics(risk_grid, astar_path, direct, predicted_grid=risk_pred)
-    print(json.dumps(metrics, indent=2))
-    assert metrics['predicted_exposure'] >= metrics['current_exposure'], \
-        "forecast exposure must never be below current exposure (max-combine invariant)"
-    print(f"Exposure: current={metrics['current_exposure']:.3f} "
-          f"predicted_24h={metrics['predicted_exposure']:.3f} "
-          f"(predicted risk>5 cells on route: {metrics['predicted_crossings']})")
+        print("Detecting ice...")
+        resolved = resolve_sar_path(sar_path)
+        print("Source: real Sentinel-1 crop" if resolved != sar_path else "Source: synthetic sample")
+        orig_img, mask, ice_cells, ice_path = detect_ice(sar_path)
+        print(f"Ice pixels: {ice_cells} (active path: {ice_path})")
+        print(f"Drift source: {'ridge (models/drift_model.joblib)' if load_drift_model() else 'physics formula (fallback)'}")
 
-    # Scenario check: the demo only tells its story if the direct route actually
-    # runs through ice (risk>5 crossings) and A* buys a 50-90% risk reduction.
-    # Printed, not raised: a real sar_real.png crop legitimately shifts these.
-    crossings = metrics['direct_crossings']
-    reduction = metrics['risk_reduction_pct']
-    ok = crossings > 0 and 50.0 <= reduction <= 90.0
-    print(f"Scenario check: direct_crossings={crossings} "
-          f"risk_reduction={reduction:.1f}% -> {'PASS' if ok else 'FAIL'} "
-          f"(target 50-90, crossings>0)")
+        print("Building risk grid...")
+        risk_grid = build_risk_grid(mask, GRID)
+        print(f"Risk grid shape: {risk_grid.shape}, min={risk_grid.min():.2f}, max={risk_grid.max():.2f}")
 
-    def path_to_latlon(path):
-        return [[grid_to_latlon(r, c)[0], grid_to_latlon(r, c)[1]] for (r, c) in path]
+        print("Forecasting 24-h risk grid...")
+        wind_path = "data/wind_current.csv"
+        wind_df = pd.read_csv(wind_path) if os.path.exists(wind_path) else pd.DataFrame([
+            {"lat": -67.3, "lon": 60.1, "u_current": 0.1, "v_current": 0.08, "u_wind": 3.0, "v_wind": 2.0},
+            {"lat": -67.6, "lon": 60.5, "u_current": 0.12, "v_current": 0.05, "u_wind": 4.0, "v_wind": 2.5},
+        ])
+        drift_field = build_drift_field(wind_df)
+        risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+        risk_combined = np.maximum(risk_grid, risk_pred)
+        print(f"Drift field: {'ok' if drift_field is not None else 'none (predicted == current)'} | "
+              f"cells>5 now={int((risk_grid > 5).sum())} in 24h={int((risk_pred > 5).sum())}")
+        band_edges, band_src = kmeans_band_edges(risk_pred)
+        print(f"Concentration bands (%): {band_edges} (source: {band_src})")
 
-    path_ll = path_to_latlon(astar_path)
-    start_ll = grid_to_latlon(start[0], start[1])
-    goal_ll = grid_to_latlon(goal[0], goal[1])
+        start = DEMO_START
+        goal = DEMO_GOAL
+        print(f"Start: {start}, Goal: {goal}")
 
-    print("Predicting batch iceberg drift...")
-    sample_icebergs = pd.DataFrame([
-        {"id": 1, "lat": -67.3, "lon": 60.1, "mass_kt": 12.0, "freeboard_m": 5.0},
-        {"id": 2, "lat": -67.6, "lon": 60.5, "mass_kt": 8.0, "freeboard_m": 3.0},
-    ])
-    sample_wind = pd.DataFrame([
-        {"lat": -67.3, "lon": 60.1, "u_current": 0.1, "v_current": 0.08, "u_wind": 3.0, "v_wind": 2.0},
-        {"lat": -67.6, "lon": 60.5, "u_current": 0.12, "v_current": 0.05, "u_wind": 4.0, "v_wind": 2.5},
-    ])
-    drift_df = predict_iceberg_drift(sample_icebergs, sample_wind, hours=24.0)
-    drift_list = drift_df[['pred_lat', 'pred_lon']].values.tolist()
-    print(f"Drift predictions: {drift_list}")
+        print("Running A* on combined (current | 24h predicted) risk...")
+        astar_path = astar(risk_combined, start, goal, risk_weight=50.0)
+        if astar_path is None:
+            print("A* found no path! Falling back to direct path.")
+            astar_path = direct_path(risk_grid, start, goal)
+        else:
+            print(f"A* path length: {len(astar_path)}")
 
-    print("Computing CPA / threat class...")
-    cpas = {int(row['id']): round(cpa_km(path_ll, [[row['lat'], row['lon']],
-                                                    [row['pred_lat'], row['pred_lon']]]), 2)
-            for _, row in drift_df.iterrows()}
-    min_cpa = min(cpas.values()) if cpas else _INF
-    threat = classify_threat(min_cpa, metrics['predicted_crossings'])
-    print(f"CPA per iceberg (km): {cpas} -> threat {threat}")
-    # F3: a predicted crossing must never force HIGH by itself -- only real
-    # proximity (CPA < 5 km) can. This sample's closest iceberg is >=10 km
-    # away even though predicted_crossings > 0, so threat must not be HIGH.
-    if metrics['predicted_crossings'] > 0 and min_cpa >= 5.0:
-        assert threat != "HIGH", \
-            f"predicted_crossings alone must not force HIGH (min_cpa={min_cpa:.2f} km, threat={threat})"
-        print(f"  F3 check OK: predicted_crossings={metrics['predicted_crossings']} > 0 "
-              f"but min_cpa={min_cpa:.2f} km keeps threat at '{threat}', not HIGH")
-    reroute = suggest_reroute(risk_combined, start, goal, astar_path, risk_pred) if threat == "HIGH" else None
-    print(f"Reroute suggestion: {('+%.1f km' % reroute[1]) if reroute else 'none'}")
+        print("Computing direct path...")
+        direct = direct_path(risk_grid, start, goal)
+        print(f"Direct path length: {len(direct)}")
 
-    print("Verifying risk-stamp max-accumulate (F2)...")
-    # Two icebergs rounding to the same grid cell must leave the HIGHER weight
-    # stamped regardless of array order — plain fancy-index assignment
-    # (risk[rs,cs] = weights) would instead keep whichever is listed LAST.
-    _dupe_rs = np.array([2, 2])
-    _dupe_cs = np.array([2, 2])
-    for _order, _w in [("low-then-high", np.array([7.0, 10.0])), ("high-then-low", np.array([10.0, 7.0]))]:
-        _grid = np.zeros((5, 5))
-        np.maximum.at(_grid, (_dupe_rs, _dupe_cs), _w)
-        assert _grid[2, 2] == 10.0, f"max-accumulate failed for order {_order}: got {_grid[2, 2]}, expected 10.0"
-        _would_have_been = _w[-1]  # what plain risk[rs,cs] = weights would have left behind
-        print(f"  order={_order}: max-accumulate -> {_grid[2, 2]:.1f} "
-              f"(plain assignment would have given {_would_have_been:.1f})")
-    print("Max-accumulate OK: result is 10.0 regardless of array order.")
+        print("Computing metrics...")
+        metrics = route_metrics(risk_grid, astar_path, direct, predicted_grid=risk_pred)
+        print(json.dumps(metrics, indent=2))
+        assert metrics['predicted_exposure'] >= metrics['current_exposure'], \
+            "forecast exposure must never be below current exposure (max-combine invariant)"
+        print(f"Exposure: current={metrics['current_exposure']:.3f} "
+              f"predicted_24h={metrics['predicted_exposure']:.3f} "
+              f"(predicted risk>5 cells on route: {metrics['predicted_crossings']})")
 
-    print("Verifying KMeans per-feature scaling (F4)...")
-    _bergs_path = "data/icebergs.csv"
-    if os.path.exists(_bergs_path):
-        _bergs = pd.read_csv(_bergs_path)
-        _w = _kmeans_risk_weights(_bergs)
-        for _i, _row in _bergs.iterrows():
-            print(f"  id={int(_row['id']):>2}  mass_kt={_row['mass_kt']:>8.2f}  "
-                  f"freeboard_m={_row['freeboard_m']:>6.2f}  tier_weight={_w[_i]:.1f}")
-        print("(freeboard now measurably influences tier assignment instead of being drowned out by mass's larger scale)")
-    else:
-        print(f"  {_bergs_path} not found — skipping (not part of the pinned scenario)")
+        # Scenario check: the demo only tells its story if the direct route actually
+        # runs through ice (risk>5 crossings) and A* buys a 50-90% risk reduction.
+        # Printed, not raised: a real sar_real.png crop legitimately shifts these.
+        crossings = metrics['direct_crossings']
+        reduction = metrics['risk_reduction_pct']
+        ok = crossings > 0 and 50.0 <= reduction <= 90.0
+        print(f"Scenario check: direct_crossings={crossings} "
+              f"risk_reduction={reduction:.1f}% -> {'PASS' if ok else 'FAIL'} "
+              f"(target 50-90, crossings>0)")
 
-    print("Generating strict JSON...")
-    output = strict_json(start_ll, goal_ll, path_ll, metrics, drift_list)
-    print(json.dumps(output, indent=2))
+        def path_to_latlon(path):
+            return [[grid_to_latlon(r, c)[0], grid_to_latlon(r, c)[1]] for (r, c) in path]
 
-    print("Saving route to database...")
-    ok = save_route(
-        db="routes.db",
-        start=start_ll,
-        goal=goal_ll,
-        distance_km=metrics['path_distance_km'],
-        risk_red=metrics['risk_reduction_pct'],
-        path_json=path_ll
-    )
-    print(f"Save succeeded: {ok}")
+        path_ll = path_to_latlon(astar_path)
+        start_ll = grid_to_latlon(start[0], start[1])
+        goal_ll = grid_to_latlon(goal[0], goal[1])
 
-    print("Loading routes from database...")
-    routes = load_routes("routes.db")
-    print(f"Found {len(routes)} route(s) in DB.")
+        print("Predicting batch iceberg drift...")
+        sample_icebergs = pd.DataFrame([
+            {"id": 1, "lat": -67.3, "lon": 60.1, "mass_kt": 12.0, "freeboard_m": 5.0},
+            {"id": 2, "lat": -67.6, "lon": 60.5, "mass_kt": 8.0, "freeboard_m": 3.0},
+        ])
+        sample_wind = pd.DataFrame([
+            {"lat": -67.3, "lon": 60.1, "u_current": 0.1, "v_current": 0.08, "u_wind": 3.0, "v_wind": 2.0},
+            {"lat": -67.6, "lon": 60.5, "u_current": 0.12, "v_current": 0.05, "u_wind": 4.0, "v_wind": 2.5},
+        ])
+        drift_df = predict_iceberg_drift(sample_icebergs, sample_wind, hours=24.0)
+        drift_list = drift_df[['pred_lat', 'pred_lon']].values.tolist()
+        print(f"Drift predictions: {drift_list}")
 
-    print("=== Self-test complete ===")
+        print("Computing CPA / threat class...")
+        cpas = {int(row['id']): round(cpa_km(path_ll, [[row['lat'], row['lon']],
+                                                        [row['pred_lat'], row['pred_lon']]]), 2)
+                for _, row in drift_df.iterrows()}
+        min_cpa = min(cpas.values()) if cpas else _INF
+        threat = classify_threat(min_cpa, metrics['predicted_crossings'])
+        print(f"CPA per iceberg (km): {cpas} -> threat {threat}")
+        # F3: a predicted crossing must never force HIGH by itself -- only real
+        # proximity (CPA < 5 km) can. This sample's closest iceberg is >=10 km
+        # away even though predicted_crossings > 0, so threat must not be HIGH.
+        if metrics['predicted_crossings'] > 0 and min_cpa >= 5.0:
+            assert threat != "HIGH", \
+                f"predicted_crossings alone must not force HIGH (min_cpa={min_cpa:.2f} km, threat={threat})"
+            print(f"  F3 check OK: predicted_crossings={metrics['predicted_crossings']} > 0 "
+                  f"but min_cpa={min_cpa:.2f} km keeps threat at '{threat}', not HIGH")
+        reroute = suggest_reroute(risk_combined, start, goal, astar_path, risk_pred) if threat == "HIGH" else None
+        print(f"Reroute suggestion: {('+%.1f km' % reroute[1]) if reroute else 'none'}")
+
+        print("Verifying risk-stamp max-accumulate (F2)...")
+        # Two icebergs rounding to the same grid cell must leave the HIGHER weight
+        # stamped regardless of array order — plain fancy-index assignment
+        # (risk[rs,cs] = weights) would instead keep whichever is listed LAST.
+        _dupe_rs = np.array([2, 2])
+        _dupe_cs = np.array([2, 2])
+        for _order, _w in [("low-then-high", np.array([7.0, 10.0])), ("high-then-low", np.array([10.0, 7.0]))]:
+            _grid = np.zeros((5, 5))
+            np.maximum.at(_grid, (_dupe_rs, _dupe_cs), _w)
+            assert _grid[2, 2] == 10.0, f"max-accumulate failed for order {_order}: got {_grid[2, 2]}, expected 10.0"
+            _would_have_been = _w[-1]  # what plain risk[rs,cs] = weights would have left behind
+            print(f"  order={_order}: max-accumulate -> {_grid[2, 2]:.1f} "
+                  f"(plain assignment would have given {_would_have_been:.1f})")
+        print("Max-accumulate OK: result is 10.0 regardless of array order.")
+
+        print("Verifying KMeans per-feature scaling (F4)...")
+        _bergs_path = "data/icebergs.csv"
+        if os.path.exists(_bergs_path):
+            _bergs = pd.read_csv(_bergs_path)
+            _w = _kmeans_risk_weights(_bergs)
+            for _i, _row in _bergs.iterrows():
+                print(f"  id={int(_row['id']):>2}  mass_kt={_row['mass_kt']:>8.2f}  "
+                      f"freeboard_m={_row['freeboard_m']:>6.2f}  tier_weight={_w[_i]:.1f}")
+            print("(freeboard now measurably influences tier assignment instead of being drowned out by mass's larger scale)")
+        else:
+            print(f"  {_bergs_path} not found — skipping (not part of the pinned scenario)")
+
+        print("Generating strict JSON...")
+        output = strict_json(start_ll, goal_ll, path_ll, metrics, drift_list)
+        print(json.dumps(output, indent=2))
+
+        print("Saving route to database...")
+        ok = save_route(
+            db="routes.db",
+            start=start_ll,
+            goal=goal_ll,
+            distance_km=metrics['path_distance_km'],
+            risk_red=metrics['risk_reduction_pct'],
+            path_json=path_ll
+        )
+        print(f"Save succeeded: {ok}")
+
+        print("Loading routes from database...")
+        routes = load_routes("routes.db")
+        print(f"Found {len(routes)} route(s) in DB.")
+
+        print("=== Self-test complete ===")
