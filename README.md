@@ -11,7 +11,13 @@ No internet. No API keys. No cloud. Runs on a laptop in the Southern Ocean.
 ![Offline](https://img.shields.io/badge/network-zero%20calls-success)
 ![Stack](https://img.shields.io/badge/stack-Streamlit%20%2B%20OpenCV%20%2B%20PyTorch*%20%2B%20scikit--learn*-orange)
 
-\* PyTorch is optional — the SmallUNet path activates only once trained weights
+\* see Model status below.
+
+---
+
+## Model status (read first)
+
+PyTorch is optional — the SmallUNet path activates only once trained weights
 clear the accuracy bar (none yet: Otsu is active). scikit-learn is live: the
 Ridge drift model in `models/drift_model.joblib` and on-the-fly KMeans
 (iceberg risk tiers, overlay legend bands). See TRAINING_REPORT.md.

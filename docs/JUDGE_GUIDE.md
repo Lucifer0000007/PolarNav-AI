@@ -1,6 +1,9 @@
 # PolarNav AI — Judge Guide (SIH26059)
 Offline Antarctic ice-navigation decision support — no black boxes.
 
+## Model status (read first)
+Vision: SmallUNet exists and is architecture-verified, but is gated behind a Dice bar (>=0.60 and >= Otsu+0.05) it has not yet cleared — Otsu is the active path today. Drift: the Ridge model is trained on synthetic samples that reproduce the physics formula — this certifies the pipeline, not real-world drift skill. KMeans: unsupervised risk-tier clustering, not a prediction model.
+
 ## The system in one breath
 A real NSIDC extent record drives a synthetic SAR patch, segmented into an ice mask, built into a 0-10 risk grid, advected 24 h by wind/current, routed with a risk-penalized A*, and reported as metrics, alerts, and JSON.
 

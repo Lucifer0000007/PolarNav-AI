@@ -31,6 +31,8 @@ folium.Map.default_js = [("leaflet", "/app/static/leaflet.js")]
 folium.Map.default_css = [("leaflet_css", "/app/static/leaflet.css")]
 
 st.title("🧊 PolarNav AI — Edge-Native Antarctic Decision Support")
+st.info("Model status: Otsu is active for ice detection (U-Net exists but hasn't cleared its Dice bar); "
+        "the Ridge drift model is trained on synthetic physics samples, not observed data.")
 
 # Sidebar — the toggle's value is now actually used (see map tiles below)
 # instead of being discarded.
