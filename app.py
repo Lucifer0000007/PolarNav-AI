@@ -1,5 +1,7 @@
 import os
 import hashlib
+import math
+import socket
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -12,7 +14,7 @@ import json
 from engine import (
     make_synthetic_sar, detect_ice, build_risk_grid, predict_iceberg_drift,
     astar, direct_path, route_metrics, save_route, load_routes, strict_json,
-    grid_to_latlon, resolve_sar_path, sample_seaice_row,
+    grid_to_latlon, latlon_to_grid, resolve_sar_path, sample_seaice_row,
     build_drift_field, predict_risk_grid, kmeans_band_edges,
     cpa_km, classify_threat, suggest_reroute,
     GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
@@ -68,6 +70,8 @@ _defaults = {
     "route_data": None,    # F5: plain data, never a folium.Map object
     "route_error": None,
     "last_drop_at": None,  # M5: UTC datetime of the last successful F1 (live or static); drives the stale-drop banner
+    "last_route_start_ll": None,  # M2: (lat, lon) the current route was computed from; drift-hysteresis baseline
+    "nmea_live_start": None,      # M2: (r, c) from the live GPS feed, or None when unreachable (read by M4's status page)
 }
 for _key, _val in _defaults.items():
     if _key not in st.session_state:
@@ -242,119 +246,228 @@ def _coord_label(t):
     return f"{t} · {lat:.3f}, {lon:.3f}"
 
 
+def _compute_route(start_coord, goal_coord) -> bool:
+    """Shared route computation: the manual button below and M2's
+    drift-triggered auto-replan both call this. Precondition (checked by
+    each caller, not here, since the right UX on a missing precondition
+    differs): st.session_state.ice_detected must already be True.
+    Writes route_data/route_error exactly as the original inline button
+    body did; returns True on success."""
+    try:
+        risk_grid = st.session_state.risk_grid
+        notes = []
+
+        # Predict iceberg drift (batch, tolerant of empty/missing data)
+        pred_df = predict_iceberg_drift(
+            st.session_state.icebergs_df, st.session_state.wind_df, hours=24.0)
+
+        drift_list = []     # predicted positions only (feeds the strict JSON)
+        iceberg_pairs = []  # (current, predicted) pairs for the drift arrows
+        tracks = []         # (id, current, predicted) for the CPA alerts
+        for _, row in pred_df.iterrows():
+            if pd.isna(row.get('pred_lat')) or pd.isna(row.get('pred_lon')):
+                continue
+            curr_loc = [row['lat'], row['lon']]
+            pred_loc = [row['pred_lat'], row['pred_lon']]
+            drift_list.append(pred_loc)
+            iceberg_pairs.append((curr_loc, pred_loc))
+            _id = row.get('id', '?')
+            if isinstance(_id, float) and _id.is_integer():
+                _id = int(_id)  # iterrows upcasts int ids to float; show "4", not "4.0"
+            tracks.append((_id, curr_loc, pred_loc))
+
+        # 24-h sea-ice concentration forecast: advect today's risk grid by
+        # the drift field, max-combine, and plan against the combination so
+        # the route avoids ice that will be there tomorrow, not just today.
+        drift_field = build_drift_field(st.session_state.wind_df)
+        risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+        risk_combined = np.maximum(risk_grid, risk_pred) if risk_grid is not None else None
+        band_edges, band_src = kmeans_band_edges(risk_pred)
+
+        # Pathfinding — fall back to the direct path if A* can't reach the goal
+        # (unreachable goal, missing grid, or out-of-bounds coordinates).
+        opt_path = astar(risk_combined, start_coord, goal_coord)
+        dir_path = direct_path(risk_grid, start_coord, goal_coord)
+        if opt_path is None:
+            notes.append(("warning",
+                          "No A* route found to the goal — showing the direct path instead."))
+            opt_path = dir_path
+
+        # Compute metrics (risk_grid first — matches route_metrics' real signature)
+        metrics = route_metrics(risk_grid, opt_path, dir_path, predicted_grid=risk_pred)
+
+        # Live alerts (display-only): per-iceberg CPA against its 24-h track
+        # drives proximity threat (HIGH/MED/LOW, CPA-only per F3); predicted
+        # risk>5 crossings is a SEPARATE, independent advisory line — it
+        # never escalates a distant iceberg to HIGH by itself. A HIGH
+        # proximity threat asks for a reroute SUGGESTION — the shown route
+        # never auto-switches; the captain decides.
+        route_ll = [grid_to_latlon(r, c) for r, c in opt_path]
+        cpas = [(ib_id, cpa_km(route_ll, [curr_loc, pred_loc])) for ib_id, curr_loc, pred_loc in tracks]
+        min_cpa = min((c for _, c in cpas), default=float('inf'))
+        pred_x = metrics['predicted_crossings']
+        threat = classify_threat(min_cpa, 0)  # proximity-only; predicted_crossings no longer affects this
+        reroute = suggest_reroute(risk_combined, start_coord, goal_coord,
+                                  opt_path, risk_pred) if threat == "HIGH" else None
+        suggestion = (f"alternate route suggested (+{reroute[1]:.1f} km)" if reroute
+                      else "no lower-exposure alternative found")
+        alerts = []
+        for ib_id, cpa in sorted(cpas, key=lambda t: t[1]):
+            lvl = classify_threat(cpa, 0)  # proximity class of this iceberg alone
+            if lvl == "HIGH":
+                alerts.append(("error", f"HIGH: Iceberg {ib_id} CPA {cpa:.1f} km — {suggestion}"))
+            elif lvl == "MED":
+                alerts.append(("warning", f"MED: route passes within {cpa:.1f} km of {ib_id} drift corridor"))
+        if pred_x > 0:
+            alerts.append(("warning", f"MED: Route crosses {pred_x} predicted risk>5 cells - expect icebreaking"))
+        if not alerts:
+            alerts.append(("info", "LOW: corridor clear for 24 h"))
+        alerts.append(("info", f"Predicted risk>5 cells on route: {pred_x}"))
+
+        start_ll = grid_to_latlon(*start_coord)
+        goal_ll = grid_to_latlon(*goal_coord)
+
+        saved = save_route(
+            start=start_ll, goal=goal_ll,
+            distance_km=metrics['path_distance_km'],
+            risk_red=metrics['risk_reduction_pct'],
+            path_json=[grid_to_latlon(r, c) for r, c in opt_path],
+        )
+        if not saved:
+            notes.append(("info",
+                          "Route computed, but the local route log couldn't be written this run."))
+
+        # Store DATA, never the folium.Map — the map is rebuilt fresh at
+        # page level on every run from exactly this dict.
+        st.session_state.route_data = {
+            "path": opt_path,
+            "direct": dir_path,
+            "drift_list": drift_list,
+            "metrics": metrics,
+            "icebergs": iceberg_pairs,
+            "start_ll": start_ll,
+            "goal_ll": goal_ll,
+            "notes": notes,
+            "risk_pred": risk_pred,        # 24-h forecast grid (overlay)
+            "band_edges": band_edges,      # concentration band edges, %
+            "band_src": band_src,          # "kmeans" | "fixed"
+            "alerts": alerts,              # [(kind, text)] replayed every rerun
+        }
+        st.session_state.route_error = None
+        return True
+    except Exception as e:
+        st.session_state.route_error = f"Route generation failed: {e}"
+        return False
+
+
+# ---- M2: NMEA live position (loopback probe only; unreachable -> pinned, never raises) ----
+def _dm_to_decimal(dm_str: str, hemi: str) -> float:
+    """NMEA ddmm.mmmm / dddmm.mmmm -> decimal degrees. The last 2 integer
+    digits before the decimal point are always minutes, regardless of
+    whether the degree part is 2 digits (lat) or 3 (lon) -- verified by
+    round-tripping nmea_sim.py's own sentence builder against this."""
+    dot = dm_str.index(".")
+    deg = int(dm_str[:dot - 2])
+    minutes = float(dm_str[dot - 2:])
+    dec = deg + minutes / 60.0
+    return -dec if hemi in ("S", "W") else dec
+
+
+def _parse_nmea_line(line: str):
+    """One GPGGA/RMC sentence -> (lat, lon), or None. Tries pynmea2 first
+    if importable, else the stdlib fallback above -- verified to agree
+    with pynmea2 on the same sentences before being relied on here."""
+    line = line.strip()
+    if not line.startswith("$") or "*" not in line:
+        return None
+    try:
+        import pynmea2
+        msg = pynmea2.parse(line)
+        return float(msg.latitude), float(msg.longitude)
+    except Exception:
+        pass
+    try:
+        body = line.split("*")[0][1:]
+        fields = body.split(",")
+        sid = fields[0]
+        if sid.endswith("GGA"):
+            return _dm_to_decimal(fields[2], fields[3]), _dm_to_decimal(fields[4], fields[5])
+        if sid.endswith("RMC"):
+            return _dm_to_decimal(fields[3], fields[4]), _dm_to_decimal(fields[5], fields[6])
+    except Exception:
+        pass
+    return None
+
+
+def _nmea_probe():
+    """0.2s loopback-only connect probe; reads one sentence. Returns
+    (lat, lon) or None. Never raises -- nmea_sim.py absence is a normal,
+    fully-supported state, not an error."""
+    try:
+        with socket.create_connection(("127.0.0.1", 10110), timeout=0.2) as s:
+            s.settimeout(1.0)
+            buf = b""
+            while b"\n" not in buf and len(buf) < 1024:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                buf += chunk
+        return _parse_nmea_line(buf.split(b"\n")[0].decode("ascii", errors="ignore"))
+    except Exception:
+        return None
+
+
+def _km_between(ll1, ll2) -> float:
+    """Quick equirectangular distance in km for the 2 km drift-hysteresis
+    check only -- UI-side, not core routing math (engine.py untouched)."""
+    lat1, lon1 = ll1
+    lat2, lon2 = ll2
+    cos_lat = math.cos(math.radians((lat1 + lat2) / 2.0))
+    dlat = (lat2 - lat1) * 111.0
+    dlon = (lon2 - lon1) * 111.0 * cos_lat
+    return math.hypot(dlat, dlon)
+
+
+@st.fragment(run_every="1s")
+def _position_badge():
+    pos = _nmea_probe()
+    if pos is not None:
+        lat, lon = pos
+        r, c = latlon_to_grid(lat, lon)
+        st.session_state.nmea_live_start = (r, c)
+        st.success(f"🛰 LIVE POS: ({r}, {c}) · {lat:.3f}, {lon:.3f} — auto-replans past 2 km drift "
+                   f"(manual Start dropdown below still works independently)")
+        goal = st.session_state.get("goal_coord_select", coords_list[-1])
+        if (st.session_state.ice_detected and st.session_state.last_route_start_ll is not None
+                and _km_between(st.session_state.last_route_start_ll, (lat, lon)) > 2.0):
+            if _compute_route((r, c), goal):
+                st.session_state.last_route_start_ll = (lat, lon)
+                # The map/metrics/alerts below live OUTSIDE this fragment's own
+                # render scope, so a fragment-only rerun would update
+                # route_data silently without the visible page catching up.
+                # scope="app" (the default) forces the full page to re-render
+                # with the new route -- documented Streamlit pattern for a
+                # fragment whose state change affects content outside itself.
+                st.rerun()
+    else:
+        st.session_state.nmea_live_start = None
+        st.caption("📍 PINNED — no live GPS feed (nmea_sim.py not reachable on 127.0.0.1:10110); using the manual dropdown below")
+
+
+_position_badge()
+
 col_s, col_g = st.columns(2)
 start_coord = col_s.selectbox("Start Grid Coordinate", coords_list, index=0,
-                               format_func=_coord_label)
+                               format_func=_coord_label, key="start_coord_select")
 goal_coord = col_g.selectbox("Goal Grid Coordinate", coords_list, index=3,
-                              format_func=_coord_label)
+                              format_func=_coord_label, key="goal_coord_select")
 
 if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
     if not st.session_state.ice_detected:
         st.warning("Please detect ice hazards first.")
     else:
-        try:
-            risk_grid = st.session_state.risk_grid
-            notes = []
-
-            # Predict iceberg drift (batch, tolerant of empty/missing data)
-            pred_df = predict_iceberg_drift(
-                st.session_state.icebergs_df, st.session_state.wind_df, hours=24.0)
-
-            drift_list = []     # predicted positions only (feeds the strict JSON)
-            iceberg_pairs = []  # (current, predicted) pairs for the drift arrows
-            tracks = []         # (id, current, predicted) for the CPA alerts
-            for _, row in pred_df.iterrows():
-                if pd.isna(row.get('pred_lat')) or pd.isna(row.get('pred_lon')):
-                    continue
-                curr_loc = [row['lat'], row['lon']]
-                pred_loc = [row['pred_lat'], row['pred_lon']]
-                drift_list.append(pred_loc)
-                iceberg_pairs.append((curr_loc, pred_loc))
-                _id = row.get('id', '?')
-                if isinstance(_id, float) and _id.is_integer():
-                    _id = int(_id)  # iterrows upcasts int ids to float; show "4", not "4.0"
-                tracks.append((_id, curr_loc, pred_loc))
-
-            # 24-h sea-ice concentration forecast: advect today's risk grid by
-            # the drift field, max-combine, and plan against the combination so
-            # the route avoids ice that will be there tomorrow, not just today.
-            drift_field = build_drift_field(st.session_state.wind_df)
-            risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
-            risk_combined = np.maximum(risk_grid, risk_pred) if risk_grid is not None else None
-            band_edges, band_src = kmeans_band_edges(risk_pred)
-
-            # Pathfinding — fall back to the direct path if A* can't reach the goal
-            # (unreachable goal, missing grid, or out-of-bounds coordinates).
-            opt_path = astar(risk_combined, start_coord, goal_coord)
-            dir_path = direct_path(risk_grid, start_coord, goal_coord)
-            if opt_path is None:
-                notes.append(("warning",
-                              "No A* route found to the goal — showing the direct path instead."))
-                opt_path = dir_path
-
-            # Compute metrics (risk_grid first — matches route_metrics' real signature)
-            metrics = route_metrics(risk_grid, opt_path, dir_path, predicted_grid=risk_pred)
-
-            # Live alerts (display-only): per-iceberg CPA against its 24-h track
-            # drives proximity threat (HIGH/MED/LOW, CPA-only per F3); predicted
-            # risk>5 crossings is a SEPARATE, independent advisory line — it
-            # never escalates a distant iceberg to HIGH by itself. A HIGH
-            # proximity threat asks for a reroute SUGGESTION — the shown route
-            # never auto-switches; the captain decides.
-            route_ll = [grid_to_latlon(r, c) for r, c in opt_path]
-            cpas = [(ib_id, cpa_km(route_ll, [curr_loc, pred_loc])) for ib_id, curr_loc, pred_loc in tracks]
-            min_cpa = min((c for _, c in cpas), default=float('inf'))
-            pred_x = metrics['predicted_crossings']
-            threat = classify_threat(min_cpa, 0)  # proximity-only; predicted_crossings no longer affects this
-            reroute = suggest_reroute(risk_combined, start_coord, goal_coord,
-                                      opt_path, risk_pred) if threat == "HIGH" else None
-            suggestion = (f"alternate route suggested (+{reroute[1]:.1f} km)" if reroute
-                          else "no lower-exposure alternative found")
-            alerts = []
-            for ib_id, cpa in sorted(cpas, key=lambda t: t[1]):
-                lvl = classify_threat(cpa, 0)  # proximity class of this iceberg alone
-                if lvl == "HIGH":
-                    alerts.append(("error", f"HIGH: Iceberg {ib_id} CPA {cpa:.1f} km — {suggestion}"))
-                elif lvl == "MED":
-                    alerts.append(("warning", f"MED: route passes within {cpa:.1f} km of {ib_id} drift corridor"))
-            if pred_x > 0:
-                alerts.append(("warning", f"MED: Route crosses {pred_x} predicted risk>5 cells - expect icebreaking"))
-            if not alerts:
-                alerts.append(("info", "LOW: corridor clear for 24 h"))
-            alerts.append(("info", f"Predicted risk>5 cells on route: {pred_x}"))
-
-            start_ll = grid_to_latlon(*start_coord)
-            goal_ll = grid_to_latlon(*goal_coord)
-
-            saved = save_route(
-                start=start_ll, goal=goal_ll,
-                distance_km=metrics['path_distance_km'],
-                risk_red=metrics['risk_reduction_pct'],
-                path_json=[grid_to_latlon(r, c) for r, c in opt_path],
-            )
-            if not saved:
-                notes.append(("info",
-                              "Route computed, but the local route log couldn't be written this run."))
-
-            # Store DATA, never the folium.Map — the map is rebuilt fresh at
-            # page level on every run from exactly this dict.
-            st.session_state.route_data = {
-                "path": opt_path,
-                "direct": dir_path,
-                "drift_list": drift_list,
-                "metrics": metrics,
-                "icebergs": iceberg_pairs,
-                "start_ll": start_ll,
-                "goal_ll": goal_ll,
-                "notes": notes,
-                "risk_pred": risk_pred,        # 24-h forecast grid (overlay)
-                "band_edges": band_edges,      # concentration band edges, %
-                "band_src": band_src,          # "kmeans" | "fixed"
-                "alerts": alerts,              # [(kind, text)] replayed every rerun
-            }
-            st.session_state.route_error = None
-        except Exception as e:
-            st.session_state.route_error = f"Route generation failed: {e}"
+        if _compute_route(start_coord, goal_coord):
+            st.session_state.last_route_start_ll = grid_to_latlon(*start_coord)  # M2: drift-hysteresis baseline
 
 
 # Ice-blue ramp, one colour per concentration band (light -> deep).
