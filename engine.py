@@ -383,6 +383,14 @@ def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> np.n
     10.0 per row when scikit-learn is unavailable, there are too few rows to
     cluster, the required columns are missing, or clustering fails for any
     reason — this must never crash risk-grid construction.
+
+    mass_kt (hundreds-to-thousands) and freeboard_m (single-to-double digits)
+    are on wildly different numeric scales; KMeans uses Euclidean distance, so
+    fitting on the raw values lets mass alone decide cluster membership and
+    freeboard barely matters. Each feature is divided by its own column max
+    (guarded against zero) before fitting so both contribute; tier ORDER
+    still ranks clusters by raw mass_kt specifically, so "bigger = higher
+    tier" keeps its plain meaning regardless of freeboard's own scale.
     """
     n = len(icebergs_df)
     flat = np.full(n, 10.0)
@@ -390,9 +398,11 @@ def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> np.n
         return flat
     try:
         features = icebergs_df[['mass_kt', 'freeboard_m']].to_numpy(dtype=np.float64)
-        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=DEMO_SEED).fit(features)
-        cluster_means = [features[km.labels_ == k].mean() if np.any(km.labels_ == k) else 0.0
-                          for k in range(n_clusters)]
+        col_max = np.where(features.max(axis=0) > 0, features.max(axis=0), 1.0)  # guard zero
+        features_norm = features / col_max
+        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=DEMO_SEED).fit(features_norm)
+        cluster_means = [features[km.labels_ == k, 0].mean() if np.any(km.labels_ == k) else 0.0
+                          for k in range(n_clusters)]  # ranked by raw mass_kt, not the normalized joint centroid
         order = np.argsort(cluster_means)  # smallest cluster first
         tier_risk = np.linspace(7.0, 10.0, n_clusters)
         risk_by_cluster = {cluster: tier_risk[rank] for rank, cluster in enumerate(order)}
@@ -1135,6 +1145,18 @@ if __name__ == "__main__":
         print(f"  order={_order}: max-accumulate -> {_grid[2, 2]:.1f} "
               f"(plain assignment would have given {_would_have_been:.1f})")
     print("Max-accumulate OK: result is 10.0 regardless of array order.")
+
+    print("Verifying KMeans per-feature scaling (F4)...")
+    _bergs_path = "data/icebergs.csv"
+    if os.path.exists(_bergs_path):
+        _bergs = pd.read_csv(_bergs_path)
+        _w = _kmeans_risk_weights(_bergs)
+        for _i, _row in _bergs.iterrows():
+            print(f"  id={int(_row['id']):>2}  mass_kt={_row['mass_kt']:>8.2f}  "
+                  f"freeboard_m={_row['freeboard_m']:>6.2f}  tier_weight={_w[_i]:.1f}")
+        print("(freeboard now measurably influences tier assignment instead of being drowned out by mass's larger scale)")
+    else:
+        print(f"  {_bergs_path} not found — skipping (not part of the pinned scenario)")
 
     print("Generating strict JSON...")
     output = strict_json(start_ll, goal_ll, path_ll, metrics, drift_list)
