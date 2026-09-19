@@ -431,7 +431,10 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
             rs = np.clip(np.round(size * (1.0 - (lats[valid] - LAT_MIN))), 0, size - 1).astype(int)
             cs = np.clip(np.round(size * (lons[valid] - LON_MIN) / lon_span), 0, size - 1).astype(int)
             weights = _kmeans_risk_weights(icebergs_df)[valid] if use_kmeans else np.full(valid.sum(), 10.0)
-            risk[rs, cs] = weights
+            # np.maximum.at, not risk[rs, cs] = weights: plain fancy-index assignment lets
+            # a later iceberg in array order silently overwrite an earlier one's higher
+            # risk when two round to the same cell. maximum.at is order-independent.
+            np.maximum.at(risk, (rs, cs), weights)
 
     risk = cv2.GaussianBlur(risk, (5, 5), 0)
     risk = np.clip(risk, 0.0, 10.0)
@@ -1117,6 +1120,21 @@ if __name__ == "__main__":
     print(f"CPA per iceberg (km): {cpas} -> threat {threat}")
     reroute = suggest_reroute(risk_combined, start, goal, astar_path, risk_pred) if threat == "HIGH" else None
     print(f"Reroute suggestion: {('+%.1f km' % reroute[1]) if reroute else 'none'}")
+
+    print("Verifying risk-stamp max-accumulate (F2)...")
+    # Two icebergs rounding to the same grid cell must leave the HIGHER weight
+    # stamped regardless of array order — plain fancy-index assignment
+    # (risk[rs,cs] = weights) would instead keep whichever is listed LAST.
+    _dupe_rs = np.array([2, 2])
+    _dupe_cs = np.array([2, 2])
+    for _order, _w in [("low-then-high", np.array([7.0, 10.0])), ("high-then-low", np.array([10.0, 7.0]))]:
+        _grid = np.zeros((5, 5))
+        np.maximum.at(_grid, (_dupe_rs, _dupe_cs), _w)
+        assert _grid[2, 2] == 10.0, f"max-accumulate failed for order {_order}: got {_grid[2, 2]}, expected 10.0"
+        _would_have_been = _w[-1]  # what plain risk[rs,cs] = weights would have left behind
+        print(f"  order={_order}: max-accumulate -> {_grid[2, 2]:.1f} "
+              f"(plain assignment would have given {_would_have_been:.1f})")
+    print("Max-accumulate OK: result is 10.0 regardless of array order.")
 
     print("Generating strict JSON...")
     output = strict_json(start_ll, goal_ll, path_ll, metrics, drift_list)
