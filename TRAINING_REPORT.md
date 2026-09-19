@@ -72,7 +72,8 @@ installed and `(source: fixed)` otherwise.
 scikit-learn 1.9.1 and joblib 1.6.0 installed via `setup_demo.bat`. The
 torch CPU wheel (2.14.0) **failed to install** with `WinError 206: filename
 too long` (Microsoft-Store Python's long site-packages path + torch's deep
-license tree; `LongPathsEnabled = 0`). A partial torch tree was left behind
-and raises `OSError` on import — `engine.py` now guards the optional import
-with `except Exception`, so the demo runs unaffected (Otsu path). Resolving
-torch is optional for finals because no U-Net weights exist to load.
+license tree; `LongPathsEnabled = 0`). The partial torch tree it left behind
+(which raised `OSError` on import) was removed; `import torch` now fails with a
+clean `ModuleNotFoundError`, and `engine.py` guards the optional import with
+`except Exception` either way, so the demo runs unaffected (Otsu path).
+Resolving torch is optional for finals because no U-Net weights exist to load.
