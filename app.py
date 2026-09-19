@@ -102,6 +102,23 @@ st.title("🧊 PolarNav AI — Edge-Native Antarctic Decision Support")
 st.info("Model status: Otsu is active for ice detection (U-Net exists but hasn't cleared its Dice bar); "
         "the Ridge drift model is trained on synthetic physics samples, not observed data.")
 
+
+# ---- M5: stale-drop banner. session_state may not have last_drop_at yet
+# (first-ever page load, before _defaults is applied below) -- .get()
+# with a None fallback handles that as a normal no-banner state, not an
+# error, matching every other optional-signal check in this file. ----
+@st.fragment(run_every="60s")
+def _stale_drop_banner():
+    last = st.session_state.get("last_drop_at")
+    if last is None:
+        return
+    age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600.0
+    if age_h > 12:
+        st.warning(f"LAST DROP: {age_h:.0f}h ago — treat as advisory only")
+
+
+_stale_drop_banner()
+
 # Sidebar — the toggle's value is now actually used (see map tiles below)
 # instead of being discarded.
 offline_mode = st.sidebar.toggle("Edge-Native Mode (Offline)", value=True)
@@ -361,6 +378,38 @@ def _coord_label(t):
     return f"{t} · {lat:.3f}, {lon:.3f}"
 
 
+# ---- M5: captain-language alerts. engine.py math is off-limits this
+# mission, so this mirrors engine.cpa_km's own equirectangular distance
+# matrix (same formula, see engine.py's cpa_km) but additionally recovers
+# WHICH route waypoint the closest approach happens at, letting us report
+# "will cross your route in X km" (distance-to-go, along the route from
+# its start) instead of a raw closest-approach distance -- a small but
+# real captain-language upgrade (matches how ship radar ARPA reports
+# report a target's distance along one's own track, not just its CPA). ----
+def _along_route_km(route_ll, track_ll, samples: int = 25):
+    """Along-route distance (km) from the route's start to the route
+    waypoint nearest the iceberg's track. Returns None on any degenerate
+    input (empty route/track, all-NaN distances) -- callers fall back to
+    the existing CPA-distance wording rather than showing a broken
+    figure; never raises."""
+    try:
+        route = np.asarray(route_ll, dtype=np.float64).reshape(-1, 2)
+        track = np.asarray(track_ll, dtype=np.float64).reshape(-1, 2)
+        if route.size == 0 or track.size == 0:
+            return None
+        if len(track) > 1:
+            track = np.vstack([np.linspace(track[i], track[i + 1], samples)
+                                for i in range(len(track) - 1)])
+        cos_lat = math.cos(math.radians(float(np.mean(route[:, 0]))))
+        dlat = (route[:, None, 0] - track[None, :, 0]) * 111.0
+        dlon = (route[:, None, 1] - track[None, :, 1]) * 111.0 * cos_lat
+        d = np.sqrt(dlat ** 2 + dlon ** 2)
+        route_idx = int(np.nanargmin(d) // d.shape[1])
+        return sum(_km_between(tuple(route[i]), tuple(route[i + 1])) for i in range(route_idx))
+    except Exception:
+        return None
+
+
 def _compute_route(start_coord, goal_coord) -> bool:
     """Shared route computation: the manual button below and M2's
     drift-triggered auto-replan both call this. Precondition (checked by
@@ -418,21 +467,31 @@ def _compute_route(start_coord, goal_coord) -> bool:
         # proximity threat asks for a reroute SUGGESTION — the shown route
         # never auto-switches; the captain decides.
         route_ll = [grid_to_latlon(r, c) for r, c in opt_path]
-        cpas = [(ib_id, cpa_km(route_ll, [curr_loc, pred_loc])) for ib_id, curr_loc, pred_loc in tracks]
-        min_cpa = min((c for _, c in cpas), default=float('inf'))
+        cpas = [(ib_id, cpa_km(route_ll, [curr_loc, pred_loc]), curr_loc, pred_loc)
+                for ib_id, curr_loc, pred_loc in tracks]
+        min_cpa = min((c for _, c, _, _ in cpas), default=float('inf'))
         pred_x = metrics['predicted_crossings']
         threat = classify_threat(min_cpa, 0)  # proximity-only; predicted_crossings no longer affects this
         reroute = suggest_reroute(risk_combined, start_coord, goal_coord,
                                   opt_path, risk_pred) if threat == "HIGH" else None
-        suggestion = (f"alternate route suggested (+{reroute[1]:.1f} km)" if reroute
+        suggestion = (f"suggested deviation +{reroute[1]:.1f} km" if reroute
                       else "no lower-exposure alternative found")
         alerts = []
-        for ib_id, cpa in sorted(cpas, key=lambda t: t[1]):
+        for ib_id, cpa, curr_loc, pred_loc in sorted(cpas, key=lambda t: t[1]):
             lvl = classify_threat(cpa, 0)  # proximity class of this iceberg alone
+            if lvl not in ("HIGH", "MED"):
+                continue
+            along = _along_route_km(route_ll, [curr_loc, pred_loc])
             if lvl == "HIGH":
-                alerts.append(("error", f"HIGH: Iceberg {ib_id} CPA {cpa:.1f} km — {suggestion}"))
+                if along is not None:
+                    alerts.append(("error", f"HIGH: {ib_id} will cross your route in {along:.1f} km — {suggestion}"))
+                else:
+                    alerts.append(("error", f"HIGH: Iceberg {ib_id} CPA {cpa:.1f} km — {suggestion}"))
             elif lvl == "MED":
-                alerts.append(("warning", f"MED: route passes within {cpa:.1f} km of {ib_id} drift corridor"))
+                if along is not None:
+                    alerts.append(("warning", f"MED: {ib_id} passes near your route in {along:.1f} km — monitor"))
+                else:
+                    alerts.append(("warning", f"MED: route passes within {cpa:.1f} km of {ib_id} drift corridor"))
         if pred_x > 0:
             alerts.append(("warning", f"MED: Route crosses {pred_x} predicted risk>5 cells - expect icebreaking"))
         if not alerts:
