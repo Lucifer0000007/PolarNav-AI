@@ -1,0 +1,25 @@
+{
+  "source": "SYNTHETIC (physics formula at lat -67.5 + Gaussian noise; see module docstring)",
+  "rows": 5000,
+  "holdout_rows": 1000,
+  "features": [
+    "u_current",
+    "v_current",
+    "u_wind",
+    "v_wind",
+    "hours"
+  ],
+  "targets": [
+    "dlat",
+    "dlon"
+  ],
+  "ridge_alpha": 0.001,
+  "model": "Pipeline(PolynomialFeatures(degree=2, interaction_only) -> Ridge)",
+  "heldout_r2_ridge": 0.9999540571965053,
+  "heldout_rmse_km_ridge": 0.2221264892110497,
+  "heldout_r2_physics_baseline": 0.9999543701686817,
+  "model_path": "models/drift_model.joblib",
+  "model_size_mb": 0.0011,
+  "size_ok_lt_10mb": true,
+  "note": "Ridge reproduces the physics formula from synthetic samples - pipeline demonstration, not observed-drift skill."
+}

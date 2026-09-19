@@ -11,8 +11,10 @@ No internet. No API keys. No cloud. Runs on a laptop in the Southern Ocean.
 ![Offline](https://img.shields.io/badge/network-zero%20calls-success)
 ![Stack](https://img.shields.io/badge/stack-Streamlit%20%2B%20OpenCV%20%2B%20PyTorch*%20%2B%20scikit--learn*-orange)
 
-\* optional — active only once trained weights are committed; Otsu / the physics
-drift formula / flat iceberg weighting are what's actually active until then.
+\* PyTorch is optional — the SmallUNet path activates only once trained weights
+clear the accuracy bar (none yet: Otsu is active). scikit-learn is live: the
+Ridge drift model in `models/drift_model.joblib` and on-the-fly KMeans
+(iceberg risk tiers, overlay legend bands). See TRAINING_REPORT.md.
 
 ---
 
@@ -36,9 +38,9 @@ machine.
 | **F1** | Satellite data drop | Ingests SAR imagery + iceberg coords + wind/current CSVs |
 | **F2** | Ice hazard detection | OpenCV Otsu (default): Gaussian blur → threshold → morphological opening. Optionally a trained SmallUNet (PyTorch, architecture matched to `sea-ice-segmentation-u-net.ipynb`) when `models/unet_weights.pth` is present, with an automatic fallback to Otsu on a missing/undertrained model |
 | **F3** | Risk grid | 40×40 cells, 0–10 risk, iceberg positions stamped as hard hazards |
-| **F4** | 24-h drift prediction | Vector kinematics — current + 3% wind forcing |
+| **F4** | 24-h drift prediction | Vector kinematics — current + 3% wind forcing (scikit-learn Ridge model in `models/drift_model.joblib`, trained on documented synthetic physics samples, with the formula as per-row fallback). The same field advects the risk grid into a 24-h **predicted concentration** overlay (max-combined; A* plans on max(current, predicted)) |
 | **F5** | Risk-aware routing | Modified 8-directional A*, green optimal vs. red direct baseline |
-| **F6** | Live metrics | Distance, risk score, ice crossings, risk reduction %, fuel penalty % |
+| **F6** | Live metrics | Distance, risk score, ice crossings, risk reduction %, fuel penalty %; current vs 24-h predicted exposure; display-only **Live Alerts** (per-iceberg CPA → HIGH/MED/LOW, reroute suggestion as text only) |
 | **F7** | Route history | Local SQLite (WAL mode), persists with no server |
 | **F8** | Fully offline | No sockets, no keys, no CDN — tiles=None basemap |
 | **F9** | Vessel API output | Strict JSON payload for NCPOR shipboard systems |
@@ -220,14 +222,22 @@ PolarNav-AI/
 │   ├── SmallUNet                      #   architecture matched to the reference notebook
 │   ├── detect_ice()                   #   F2 - returns (original, mask, pixel_count, active_path)
 │   ├── build_risk_grid()              #   F3 - 0..10 risk field, optional KMeans profiling
-│   ├── predict_drift()                #   F4 - current + 3% wind, optional Ridge model
+│   ├── predict_drift()                #   F4 - current + 3% wind, Ridge model when models/drift_model.joblib loads
+│   ├── build_drift_field()            #   F4 - wind/current CSV resampled to the 40x40 grid
+│   ├── predict_risk_grid()            #   F4 - 24-h forecast: advect risk by drift, max-combine
+│   ├── kmeans_band_edges()            #   overlay legend bands (KMeans, fixed 20% fallback)
 │   ├── astar()                        #   F5 - risk-weighted, None if unreachable
-│   ├── route_metrics()                #   F6 - guarded against divide-by-zero
+│   ├── route_metrics()                #   F6 - + current/predicted exposure, predicted crossings
+│   ├── cpa_km() / classify_threat()   #   F6 - closest point of approach -> HIGH/MED/LOW
+│   ├── suggest_reroute()              #   F6 - 2x-penalty A* offered as text, never auto-applied
 │   ├── save_route()                   #   F7 - SQLite WAL, returns bool, never raises
 │   └── strict_json()                  #   F9 - NCPOR vessel API contract
 ├── app.py                             # Streamlit UI - rendering only, no algorithms
 ├── train_unet.py                      # External SmallUNet training (Colab/Kaggle/CPU;
 │                                       #   not run by the app) -> models/unet_weights.pth
+├── train_drift.py                     # External Ridge drift training (synthetic physics samples
+│                                       #   unless data/features.csv exists) -> models/drift_model.joblib
+├── TRAINING_REPORT.md                 # What was / was not trained, with numbers and provenance
 ├── sea-ice-segmentation-u-net.ipynb   # Reference notebook SmallUNet's architecture is synced to
 ├── seaice.csv                         # NSIDC Sea Ice Index (drives synthetic SAR density)
 ├── requirements.txt / setup_demo.bat  # Pinned deps + one-shot offline-prep install
@@ -236,8 +246,9 @@ PolarNav-AI/
 │   ├── wind_current.csv              # lat, lon, u_wind, v_wind, u_current, v_current
 │   ├── coast.geojson                 # Bundled coastline - inlined, never fetched
 │   └── sar_metadata.json             # Sentinel-1 acquisition parameters
-├── models/                           # unet_weights.pth (created + committed only once a
-│                                      #   trained model clears the accuracy bar - absent now)
+├── models/
+│   └── drift_model.joblib            # Ridge drift model (tracked; <1 KB). unet_weights.pth is
+│                                      #   git-ignored and absent - no labelled patches yet
 └── demo.bat                          # One-click Windows launcher
 ```
 
@@ -304,7 +315,7 @@ persists through widget changes and file-watcher reruns instead of flickering aw
 | UI | Streamlit | Zero-config local server, no frontend build |
 | Mapping | Folium + streamlit-folium | Renders client-side with tiles disabled |
 | Vision | OpenCV (+ optional SmallUNet) | Otsu/morphology is the shipped default; a PyTorch U-Net activates only once trained weights pass the accuracy bar |
-| Drift | Physics formula (+ optional Ridge) | Current+wind kinematics is the default; a scikit-learn Ridge model activates only once trained and committed |
+| Drift | scikit-learn Ridge (+ physics fallback) | `models/drift_model.joblib` ships and loads; trained on synthetic physics samples (see TRAINING_REPORT.md), so it reproduces the kinematics rather than adding observed-drift skill. The formula remains the per-row fallback |
 | Compute | NumPy | Vectorized risk grid |
 | Data | pandas | CSV ingest with column validation |
 | Storage | SQLite (stdlib) | Serverless persistence |

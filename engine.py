@@ -21,18 +21,18 @@ from typing import List, Tuple, Optional, Dict, Any
 try:
     import torch
     import torch.nn as nn
-except ImportError:
-    torch = None
+except Exception:  # ImportError, or a broken/partial install raising OSError on DLL load
+    torch = None   # a damaged torch must never take the offline demo down: Otsu path stays live
     nn = None
 
 try:
     import joblib
-except ImportError:
+except Exception:
     joblib = None
 
 try:
     from sklearn.cluster import KMeans
-except ImportError:
+except Exception:
     KMeans = None
 
 # Constants
@@ -530,7 +530,7 @@ def kmeans_band_edges(risk_predicted: Optional[np.ndarray], n_bands: int = 5) ->
 # ----------------------------------------------------------------------
 # ML core: Ridge drift model (optional). The physics formula below is the
 # permanent fallback — never removed, always reachable.
-DRIFT_MODEL_PATH = "drift_model.joblib"
+DRIFT_MODEL_PATH = "models/drift_model.joblib"   # trained by train_drift.py (not run by the app)
 _drift_model_cache: Dict[str, Any] = {}
 
 
@@ -1029,6 +1029,7 @@ if __name__ == "__main__":
     print("Source: real Sentinel-1 crop" if resolved != sar_path else "Source: synthetic sample")
     orig_img, mask, ice_cells, ice_path = detect_ice(sar_path)
     print(f"Ice pixels: {ice_cells} (active path: {ice_path})")
+    print(f"Drift source: {'ridge (models/drift_model.joblib)' if load_drift_model() else 'physics formula (fallback)'}")
 
     print("Building risk grid...")
     risk_grid = build_risk_grid(mask, GRID)
