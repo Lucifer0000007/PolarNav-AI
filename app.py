@@ -10,6 +10,8 @@ from streamlit_folium import st_folium
 from datetime import datetime, timezone
 import json
 
+import bus  # M3: event bus -- kafka-python-ng optional inside bus.py itself; this import is always safe
+
 # Offline navigation engine imports
 from engine import (
     make_synthetic_sar, detect_ice, build_risk_grid, predict_iceberg_drift,
@@ -354,6 +356,17 @@ def _compute_route(start_coord, goal_coord) -> bool:
             "alerts": alerts,              # [(kind, text)] replayed every rerun
         }
         st.session_state.route_error = None
+
+        # M3: publish, display-only observability. bus.publish() never
+        # raises (kafka if reachable, always also events.log) so a bus
+        # hiccup can never take the route computation itself down.
+        bus.publish("route.computed", {
+            "start_ll": start_ll, "goal_ll": goal_ll,
+            "distance_km": metrics["path_distance_km"],
+            "risk_reduction_pct": metrics["risk_reduction_pct"],
+        })
+        bus.publish("alerts.raised", {"alerts": [{"level": k, "text": m} for k, m in alerts]})
+
         return True
     except Exception as e:
         st.session_state.route_error = f"Route generation failed: {e}"
@@ -623,3 +636,13 @@ with st.expander("📋 Strict JSON — vessel-API-ready payload schema (transpor
             st.caption(f"Export to {export_path} failed: {e}")
     else:
         st.write("Generate a route to preview the API payload.")
+
+with st.expander("📡 Event Stream (last 20)"):
+    st.caption(f"Transport: {bus.transport_mode()} — always also appended to {bus.EVENTS_LOG} "
+               f"regardless of transport, so this tail works either way.")
+    _events = bus.tail(20)
+    if _events:
+        for _ev in _events:
+            st.text(f"{_ev.get('ts', '?')}  {_ev.get('topic', '?')}  {json.dumps(_ev.get('payload', {}))}")
+    else:
+        st.write("No events yet — compute a route to publish route.computed and alerts.raised.")
