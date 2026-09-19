@@ -20,6 +20,12 @@ always passes each held-out patch's own explicit path to detect_ice(), so
 that redirection does not apply here, but keep it in mind if you repurpose
 this loader elsewhere.
 
+Hardware: trains on GPU automatically the moment a CUDA-enabled torch is
+installed (DEVICE below picks it up via torch.cuda.is_available(), no script
+change needed); this machine's torch build is CPU-only, so it runs on CPU,
+using ~85% of logical cores as DataLoader workers (CPU_WORKERS) with pinned,
+persistent workers to keep them fed.
+
 Usage:
     python train_unet.py --epochs 30 --holdout 5 --batch-size 4
 """
@@ -43,6 +49,15 @@ except ImportError as e:
     ) from e
 
 from engine import SmallUNet, detect_ice, UNET_WEIGHTS_PATH
+
+# Hardware utilization. DEVICE resolves to "cuda" the moment a CUDA-enabled
+# torch is installed -- no other change needed; on this CPU-only build it
+# resolves to "cpu" and training uses worker processes instead of a GPU.
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark = True  # autotune conv algorithms for our fixed patch size (cuDNN/GPU only; a harmless no-op on CPU)
+
+# Most of the machine, not all of it, so the OS/UI stays responsive.
+CPU_WORKERS = max(1, int((os.cpu_count() or 1) * 0.85))
 
 PATCH_DIR = "data/train_patches"
 IMAGES_DIR = os.path.join(PATCH_DIR, "images")
@@ -147,8 +162,8 @@ def _holdout_val_loss(model, bce, names) -> float:
         for name in names:
             img = cv2.imread(os.path.join(IMAGES_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
             mask = cv2.imread(os.path.join(MASKS_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
-            x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
-            y = torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0).unsqueeze(0)
+            x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(DEVICE, non_blocking=True)
+            y = torch.from_numpy((mask > 127).astype(np.float32)).unsqueeze(0).unsqueeze(0).to(DEVICE, non_blocking=True)
             logits = model(x)
             losses.append((bce(logits, y) + dice_loss(logits, y)).item())
     model.train()
@@ -156,6 +171,7 @@ def _holdout_val_loss(model, bce, names) -> float:
 
 
 def train(model, loader, holdout_names, epochs, lr=1e-3):
+    model.to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)  # matches notebook's Adam() default lr=0.001
     bce = nn.BCEWithLogitsLoss()
     # Mirrors the notebook's ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=8).
@@ -164,6 +180,8 @@ def train(model, loader, holdout_names, epochs, lr=1e-3):
     for epoch in range(epochs):
         total_loss = 0.0
         for x, y in loader:
+            x = x.to(DEVICE, non_blocking=True)
+            y = y.to(DEVICE, non_blocking=True)
             opt.zero_grad()
             logits = model(x)
             loss = bce(logits, y) + dice_loss(logits, y)
@@ -173,7 +191,7 @@ def train(model, loader, holdout_names, epochs, lr=1e-3):
         train_loss = total_loss / max(1, len(loader))
         val_loss = _holdout_val_loss(model, bce, holdout_names)
         scheduler.step(val_loss)
-        print(f"epoch {epoch + 1}/{epochs}  loss={train_loss:.4f}  val_loss={val_loss:.4f}")
+        print(f"epoch {epoch + 1}/{epochs}  loss={train_loss:.4f}  val_loss={val_loss:.4f}  device={DEVICE}")
 
 
 def evaluate_unet(model, names):
@@ -183,8 +201,8 @@ def evaluate_unet(model, names):
         for name in names:
             img = cv2.imread(os.path.join(IMAGES_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
             mask = cv2.imread(os.path.join(MASKS_DIR, name + ".png"), cv2.IMREAD_GRAYSCALE)
-            x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
-            probs = torch.sigmoid(model(x))[0, 0].numpy()
+            x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0).to(DEVICE, non_blocking=True)
+            probs = torch.sigmoid(model(x))[0, 0].cpu().numpy()
             pred = (probs > 0.5).astype(np.uint8) * 255
             scores.append(dice_score(pred, mask))
     return float(np.mean(scores)) if scores else 0.0
@@ -223,7 +241,15 @@ def main():
     train_names = names[:-args.holdout]
     print(f"{len(train_names)} training patches, {len(holdout_names)} held out.")
 
-    loader = DataLoader(PatchDataset(train_names, augment=True), batch_size=args.batch_size, shuffle=True)
+    print(f"Device: {DEVICE} | CPU workers: {CPU_WORKERS}")
+    loader = DataLoader(
+        PatchDataset(train_names, augment=True),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=CPU_WORKERS,
+        pin_memory=True,
+        persistent_workers=True,
+    )
     model = SmallUNet()
     train(model, loader, holdout_names, epochs=args.epochs, lr=args.lr)
 

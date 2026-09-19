@@ -429,7 +429,7 @@ if _rd is not None:
     if _iv2 is not None:
         _active_txt = "U-Net" if "SmallUNet" in _iv2["active_path"] else "Otsu"
         st.caption(f"Data Source: NSIDC Sea Ice Index (Surrogate) | "
-                   f"Model: Notebook Architecture | Active Path: {_active_txt}")
+                   f"Model: Notebook U-Net Architecture | Active Path: {_active_txt}")
 if st.session_state.route_error:
     st.error(st.session_state.route_error)
 

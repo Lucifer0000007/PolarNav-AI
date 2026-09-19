@@ -67,7 +67,31 @@ the forecast overlay legend in `kmeans_band_edges()`. Self-test shows
 `Concentration bands (%): [...] (source: kmeans)` when scikit-learn is
 installed and `(source: fixed)` otherwise.
 
-## 4. Environment note (build machine, 2026-09-19)
+## 4. Hardware-optimized training (train_unet.py, 2026-09-19)
+
+`train_unet.py` now resolves `DEVICE = "cuda" if torch.cuda.is_available() else
+"cpu"` and sets `torch.backends.cudnn.benchmark = True`; the DataLoader uses
+`num_workers = max(1, int(cpu_count * 0.85))` with `pin_memory=True` and
+`persistent_workers=True`, and all tensors move with `non_blocking=True`. On
+this machine (12 logical CPUs, CPU-only torch build) that resolves to 10
+worker processes on CPU; the same code activates a GPU automatically the
+moment a CUDA-enabled torch is installed, no script change needed.
+
+Smoke-tested end-to-end with 8 disposable synthetic patch pairs (not part of
+the repo): 2 epochs completed without error under the new device/worker
+configuration, the bar correctly rejected the resulting weights (Dice 0.00 vs
+Otsu 0.17 on 2 epochs of noise), and no weights were saved — confirming the
+hardware changes don't affect the acceptance-bar safety logic. Test artifacts
+were deleted; the "0 labelled patches" state in section 1 is unchanged.
+
+## 5. NSIDC extent calibration fix (2026-09-19)
+
+`SEAICE_EXTENT_MAX` was `19.0`; the real south-hemisphere range in
+`seaice.csv` is 2.08-20.20 M km². Corrected to `20.5` so no real historical
+day clips to exactly 100% synthetic ice coverage. `SEAICE_EXTENT_MIN` (2.0)
+already safely bounded the real minimum (2.08) and was left unchanged.
+
+## 6. Environment note (build machine, 2026-09-19)
 
 scikit-learn 1.9.1 and joblib 1.6.0 installed via `setup_demo.bat`. The
 torch CPU wheel (2.14.0) **failed to install** with `WinError 206: filename

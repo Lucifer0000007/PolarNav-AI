@@ -100,7 +100,11 @@ def resolve_sar_path(path: str = "data/sar_sample.png") -> str:
 # synthetic field shows, instead of an arbitrary fixed blob count.
 SEAICE_CSV_PATH = "seaice.csv"
 SEAICE_EXTENT_MIN = 2.0   # million km^2 -> ~0% patch ice coverage
-SEAICE_EXTENT_MAX = 19.0  # million km^2 -> ~100% patch ice coverage
+SEAICE_EXTENT_MAX = 20.5  # million km^2 -> ~100% patch ice coverage. Calibrated
+                          # against the real south-hemisphere range in
+                          # seaice.csv (2.08-20.20 M km^2); these round just
+                          # outside it so no real historical day clips to
+                          # exactly 0% or 100% coverage.
 
 _seaice_df_cache: Dict[str, Any] = {}
 
