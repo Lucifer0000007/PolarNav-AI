@@ -8,3 +8,4 @@ data/sar_sample.png
 .claude/
 CLAUDE.md
 models/*.pth
+.ml-venv/
