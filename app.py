@@ -1,4 +1,5 @@
 import os
+import numpy as np
 import pandas as pd
 import streamlit as st
 import folium
@@ -10,6 +11,8 @@ from engine import (
     make_synthetic_sar, detect_ice, build_risk_grid, predict_iceberg_drift,
     astar, direct_path, route_metrics, save_route, load_routes, strict_json,
     grid_to_latlon, resolve_sar_path, sample_seaice_row,
+    build_drift_field, predict_risk_grid, kmeans_band_edges,
+    cpa_km, classify_threat, suggest_reroute,
     GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX
 )
 
@@ -213,6 +216,7 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
 
             drift_list = []     # predicted positions only (feeds the strict JSON)
             iceberg_pairs = []  # (current, predicted) pairs for the drift arrows
+            tracks = []         # (id, current, predicted) for the CPA alerts
             for _, row in pred_df.iterrows():
                 if pd.isna(row.get('pred_lat')) or pd.isna(row.get('pred_lon')):
                     continue
@@ -220,10 +224,22 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
                 pred_loc = [row['pred_lat'], row['pred_lon']]
                 drift_list.append(pred_loc)
                 iceberg_pairs.append((curr_loc, pred_loc))
+                _id = row.get('id', '?')
+                if isinstance(_id, float) and _id.is_integer():
+                    _id = int(_id)  # iterrows upcasts int ids to float; show "4", not "4.0"
+                tracks.append((_id, curr_loc, pred_loc))
+
+            # 24-h sea-ice concentration forecast: advect today's risk grid by
+            # the drift field, max-combine, and plan against the combination so
+            # the route avoids ice that will be there tomorrow, not just today.
+            drift_field = build_drift_field(st.session_state.wind_df)
+            risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+            risk_combined = np.maximum(risk_grid, risk_pred) if risk_grid is not None else None
+            band_edges, band_src = kmeans_band_edges(risk_pred)
 
             # Pathfinding — fall back to the direct path if A* can't reach the goal
             # (unreachable goal, missing grid, or out-of-bounds coordinates).
-            opt_path = astar(risk_grid, start_coord, goal_coord)
+            opt_path = astar(risk_combined, start_coord, goal_coord)
             dir_path = direct_path(risk_grid, start_coord, goal_coord)
             if opt_path is None:
                 notes.append(("warning",
@@ -231,7 +247,33 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
                 opt_path = dir_path
 
             # Compute metrics (risk_grid first — matches route_metrics' real signature)
-            metrics = route_metrics(risk_grid, opt_path, dir_path)
+            metrics = route_metrics(risk_grid, opt_path, dir_path, predicted_grid=risk_pred)
+
+            # Live alerts (display-only): per-iceberg CPA against its 24-h track,
+            # route-level threat from the closest one + predicted crossings. A
+            # HIGH threat asks for a reroute SUGGESTION — the shown route never
+            # auto-switches; the captain decides.
+            route_ll = [grid_to_latlon(r, c) for r, c in opt_path]
+            cpas = [(ib_id, cpa_km(route_ll, [curr_loc, pred_loc])) for ib_id, curr_loc, pred_loc in tracks]
+            min_cpa = min((c for _, c in cpas), default=float('inf'))
+            pred_x = metrics['predicted_crossings']
+            threat = classify_threat(min_cpa, pred_x)
+            reroute = suggest_reroute(risk_combined, start_coord, goal_coord,
+                                      opt_path, risk_pred) if threat == "HIGH" else None
+            suggestion = (f"alternate route suggested (+{reroute[1]:.1f} km)" if reroute
+                          else "no lower-exposure alternative found")
+            alerts = []
+            for ib_id, cpa in sorted(cpas, key=lambda t: t[1]):
+                lvl = classify_threat(cpa, 0)  # proximity class of this iceberg alone
+                if lvl == "HIGH":
+                    alerts.append(("error", f"HIGH: Iceberg {ib_id} CPA {cpa:.1f} km — {suggestion}"))
+                elif lvl == "MED":
+                    alerts.append(("warning", f"MED: route passes within {cpa:.1f} km of {ib_id} drift corridor"))
+            if threat == "HIGH" and pred_x > 0 and not any(k == "error" for k, _ in alerts):
+                alerts.append(("error", f"HIGH: route crosses {pred_x} predicted risk>5 cell(s) — {suggestion}"))
+            if not alerts:
+                alerts.append(("info", "LOW: corridor clear for 24 h"))
+            alerts.append(("info", f"Predicted risk>5 cells on route: {pred_x}"))
 
             start_ll = grid_to_latlon(*start_coord)
             goal_ll = grid_to_latlon(*goal_coord)
@@ -257,10 +299,31 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
                 "start_ll": start_ll,
                 "goal_ll": goal_ll,
                 "notes": notes,
+                "risk_pred": risk_pred,        # 24-h forecast grid (overlay)
+                "band_edges": band_edges,      # concentration band edges, %
+                "band_src": band_src,          # "kmeans" | "fixed"
+                "alerts": alerts,              # [(kind, text)] replayed every rerun
             }
             st.session_state.route_error = None
         except Exception as e:
             st.session_state.route_error = f"Route generation failed: {e}"
+
+
+# Ice-blue ramp, one colour per concentration band (light -> deep).
+_BAND_RGB = [(198, 226, 255), (140, 196, 250), (86, 152, 236), (44, 98, 208), (16, 44, 128)]
+
+
+def _concentration_rgba(risk_pred, edges) -> np.ndarray:
+    """Predicted risk grid (0..10) -> RGBA uint8 image banded by concentration
+    (%); open water (0 %) stays transparent. Pure numpy: folium base64-inlines
+    the array as a PNG, so the overlay needs no file, no CDN, no matplotlib."""
+    conc = np.clip(np.asarray(risk_pred, dtype=np.float64) * 10.0, 0.0, 100.0)
+    band = np.digitize(conc, edges)  # 0..len(edges)
+    rgba = np.zeros(conc.shape + (4,), dtype=np.uint8)
+    for k, rgb in enumerate(_BAND_RGB):
+        rgba[band == k, :3] = rgb
+    rgba[..., 3] = np.where(conc > 0.0, 255, 0).astype(np.uint8)
+    return rgba
 
 
 def _build_map(rd: dict) -> folium.Map:
@@ -283,6 +346,16 @@ def _build_map(rd: dict) -> folium.Map:
         folium.GeoJson(
             coast_path, name="Coastline",
             style_function=lambda f: {"color": "#9aa4b2", "weight": 1.5, "fillOpacity": 0},
+        ).add_to(m)
+
+    # 24-h predicted ice concentration (GIS overlay). Row 0 of the grid is the
+    # northern edge (see grid_to_latlon), matching origin="upper".
+    if rd.get("risk_pred") is not None:
+        folium.raster_layers.ImageOverlay(
+            image=_concentration_rgba(rd["risk_pred"], rd.get("band_edges") or [20, 40, 60, 80]),
+            bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
+            opacity=0.45, origin="upper", mercator_project=False,
+            name="Predicted ice concentration (24 h)",
         ).add_to(m)
 
     for curr_loc, pred_loc in rd["icebergs"]:
@@ -320,6 +393,27 @@ if _rd is not None:
 
     st_folium(_build_map(_rd), width=1200, height=500,
               returned_objects=[], key="nav_map")
+
+    st.caption("Forecast horizon: 24 h | overlay = predicted concentration")
+    if _rd.get("risk_pred") is not None:
+        _e = _rd.get("band_edges") or [20, 40, 60, 80]
+        _lo = [0] + list(_e)
+        _hi = list(_e) + [100]
+        _sw = "".join(
+            f'<span style="display:inline-block;width:12px;height:12px;background:rgb{_BAND_RGB[i]};'
+            f'border:1px solid #888;margin:0 4px 0 10px;vertical-align:middle"></span>'
+            f'{_lo[i]:.0f}–{_hi[i]:.0f} %'
+            for i in range(5))
+        _src = ("bands: KMeans ice classes" if _rd.get("band_src") == "kmeans"
+                else "bands: fixed 20 % steps (KMeans unavailable)")
+        st.markdown(f'<div style="font-size:0.85em;color:#888">Ice concentration legend:{_sw}'
+                    f' &nbsp;|&nbsp; {_src}</div>', unsafe_allow_html=True)
+
+    # PS-mandated notification centre. Display-only: replayed from session
+    # state on every rerun, never switches the shown route.
+    st.markdown("### ⚠ Live Alerts (24-h horizon)")
+    for _kind, _msg in _rd.get("alerts", []):
+        {"error": st.error, "warning": st.warning}.get(_kind, st.info)(_msg)
 
     st.info("🧑‍✈️ Human-in-the-loop: AI recommends the safest path, captain retains final authority.")
 

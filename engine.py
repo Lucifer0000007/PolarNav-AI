@@ -435,6 +435,99 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
 
 
 # ----------------------------------------------------------------------
+# 3b. 24-h sea-ice concentration forecast. The present risk grid is advected
+# by the drift field (current + 3% wind, the same physics predict_drift uses)
+# and max-combined with the present state. Physics only: the optional Ridge
+# model is a per-iceberg predictor, not a per-cell field.
+def build_drift_field(wind_df: Optional[pd.DataFrame], size: int = GRID) -> Optional[np.ndarray]:
+    """
+    Resample the sparse wind/current table onto the risk grid: every cell
+    centre takes its nearest wind point, giving a (size, size, 2) array of
+    (u_total, v_total) m/s where u_total = u_current + 0.03*u_wind (the net
+    drift combination predict_drift uses). Returns None (never raises) for a
+    missing/empty/badly-shaped table; callers treat None as "no forecast,
+    predicted == current".
+    """
+    cols = ['lat', 'lon', 'u_current', 'v_current', 'u_wind', 'v_wind']
+    if wind_df is None or len(wind_df) == 0 or not set(cols).issubset(wind_df.columns):
+        return None
+    try:
+        w = wind_df[cols].apply(pd.to_numeric, errors='coerce').dropna()
+        if w.empty:
+            return None
+        w_lat, w_lon = w['lat'].to_numpy(), w['lon'].to_numpy()
+        u_tot = (w['u_current'] + 0.03 * w['u_wind']).to_numpy()
+        v_tot = (w['v_current'] + 0.03 * w['v_wind']).to_numpy()
+        rr, cc = np.meshgrid(np.arange(size), np.arange(size), indexing='ij')
+        lat_c = LAT_MIN + (1.0 - rr / size)                      # grid_to_latlon, vectorized
+        lon_c = LON_MIN + (LON_MAX - LON_MIN) * (cc / size)
+        d2 = (lat_c[..., None] - w_lat) ** 2 + (lon_c[..., None] - w_lon) ** 2
+        idx = np.argmin(d2, axis=2)
+        return np.stack([u_tot[idx], v_tot[idx]], axis=-1)
+    except Exception:
+        return None
+
+
+def predict_risk_grid(risk_grid: Optional[np.ndarray], drift_field: Optional[np.ndarray],
+                      hours: float = 24.0) -> Optional[np.ndarray]:
+    """
+    Forecast the risk grid `hours` ahead. Each cell's risk is carried by its
+    drift vector (displacement = (current + 0.03*wind) * hours, 1 deg ~ 111 km,
+    longitude scaled by cos(lat)), shifted a whole number of cells and clamped
+    to the grid edge. Cells landing on the same target keep the maximum, and
+    the result is max-combined with the present grid so forecast risk never
+    drops below current risk (ice here now is still a hazard even if the field
+    says it moves on). Never raises; drift_field=None returns a copy.
+    """
+    if risk_grid is None:
+        return None
+    if drift_field is None or drift_field.shape[:2] != risk_grid.shape:
+        return risk_grid.copy()
+    try:
+        rows, cols = risk_grid.shape
+        rr, cc = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
+        lat_c = LAT_MIN + (1.0 - rr / rows)
+        secs = hours * 3600.0
+        dlat = drift_field[..., 1] * secs / 111000.0
+        cos_lat = np.cos(np.radians(lat_c))
+        cos_lat = np.where(np.abs(cos_lat) < 1e-6, 1e-6, cos_lat)
+        dlon = drift_field[..., 0] * secs / (111000.0 * cos_lat)
+        lon_span = (LON_MAX - LON_MIN) or 1.0
+        tr = np.clip(np.round(rr - dlat * rows), 0, rows - 1).astype(int)        # r grows southward
+        tc = np.clip(np.round(cc + dlon * cols / lon_span), 0, cols - 1).astype(int)
+        advected = np.zeros_like(risk_grid)
+        np.maximum.at(advected, (tr.ravel(), tc.ravel()), risk_grid.ravel())
+        return np.maximum(risk_grid, advected)
+    except Exception:
+        return risk_grid.copy()
+
+
+def kmeans_band_edges(risk_predicted: Optional[np.ndarray], n_bands: int = 5) -> Tuple[List[float], str]:
+    """
+    Concentration band edges (percent, 0..100) for the forecast overlay
+    legend. With scikit-learn available, KMeans(n_bands) over the non-zero
+    forecast cells gives data-driven classes; the edges are midpoints between
+    sorted cluster centres (tag "kmeans"). Otherwise, or when clustering is
+    impossible (too few distinct values) or fails, fixed 20 % steps are used
+    (tag "fixed"). Never raises.
+    """
+    fixed = [20.0, 40.0, 60.0, 80.0]
+    if KMeans is None or risk_predicted is None:
+        return fixed, "fixed"
+    try:
+        vals = np.asarray(risk_predicted, dtype=np.float64).ravel() * 10.0   # risk 0..10 -> 0..100 %
+        vals = vals[vals > 0]
+        if len(np.unique(np.round(vals, 3))) < n_bands:
+            return fixed, "fixed"
+        km = KMeans(n_clusters=n_bands, n_init=10, random_state=DEMO_SEED).fit(vals.reshape(-1, 1))
+        centres = np.sort(km.cluster_centers_.ravel())
+        edges = [float(round((centres[i] + centres[i + 1]) / 2.0, 1)) for i in range(n_bands - 1)]
+        return edges, "kmeans"
+    except Exception:
+        return fixed, "fixed"
+
+
+# ----------------------------------------------------------------------
 # ML core: Ridge drift model (optional). The physics formula below is the
 # permanent fallback — never removed, always reachable.
 DRIFT_MODEL_PATH = "drift_model.joblib"
@@ -686,14 +779,19 @@ def direct_path(risk_grid: Optional[np.ndarray], start: Tuple[int, int],
 # ----------------------------------------------------------------------
 # 7. Route metrics
 def route_metrics(risk_grid: Optional[np.ndarray], path: List[Tuple[int, int]],
-                   direct: List[Tuple[int, int]]) -> Dict[str, Any]:
+                   direct: List[Tuple[int, int]],
+                   predicted_grid: Optional[np.ndarray] = None) -> Dict[str, Any]:
     """
     Compute distance/risk/crossings for both `path` and `direct`, plus
     risk_reduction_pct and fuel_penalty_pct. Divisions by the direct-path
     baseline are guarded (both already were), and a missing risk_grid is
     now tolerated (treated as zero risk everywhere) instead of crashing.
+
+    predicted_grid (see predict_risk_grid) adds the 24-h view of the same
+    path: current_exposure (== path_risk_score), predicted_exposure and
+    predicted_crossings. Without it the predicted values equal the current.
     """
-    def compute(path_list):
+    def compute(path_list, grid=risk_grid):
         if not path_list:
             return {'distance_km': 0.0, 'risk_score': 0.0, 'crossings': 0}
 
@@ -704,8 +802,8 @@ def route_metrics(risk_grid: Optional[np.ndarray], path: List[Tuple[int, int]],
             dist_cells += math.hypot(dr, dc)
         distance_km = dist_cells * KM_PER_CELL
 
-        if risk_grid is not None:
-            risks = [float(risk_grid[r, c]) for (r, c) in path_list]
+        if grid is not None:
+            risks = [float(grid[r, c]) for (r, c) in path_list]
         else:
             risks = [0.0 for _ in path_list]
         risk_score = float(np.mean(risks)) if risks else 0.0
@@ -714,6 +812,7 @@ def route_metrics(risk_grid: Optional[np.ndarray], path: List[Tuple[int, int]],
 
     path_metrics = compute(path)
     direct_metrics = compute(direct)
+    pred_metrics = compute(path, predicted_grid) if predicted_grid is not None else path_metrics
 
     if direct_metrics['risk_score'] > 0:
         risk_reduction_pct = (direct_metrics['risk_score'] - path_metrics['risk_score']) \
@@ -735,8 +834,71 @@ def route_metrics(risk_grid: Optional[np.ndarray], path: List[Tuple[int, int]],
         'path_crossings': path_metrics['crossings'],
         'direct_crossings': direct_metrics['crossings'],
         'risk_reduction_pct': risk_reduction_pct,
-        'fuel_penalty_pct': fuel_penalty_pct
+        'fuel_penalty_pct': fuel_penalty_pct,
+        'current_exposure': path_metrics['risk_score'],
+        'predicted_exposure': pred_metrics['risk_score'],
+        'predicted_crossings': pred_metrics['crossings'],
     }
+
+
+# ----------------------------------------------------------------------
+# 7b. Alerting: closest point of approach, threat class, reroute suggestion
+def cpa_km(route_latlon: List[Any], track_latlon: List[Any], samples: int = 25) -> float:
+    """
+    Closest Point of Approach (km) between a route polyline (list of
+    (lat, lon) waypoints) and an iceberg's 24-h track (list of (lat, lon),
+    typically [current, predicted]); the track is densified to `samples`
+    points per segment. Equirectangular distance with longitude scaled by
+    cos(mean route lat), accurate to well under 1 % on this 1 x 1.5 deg
+    patch. Returns inf (never raises) when either input is empty.
+    """
+    try:
+        route = np.asarray(route_latlon, dtype=np.float64).reshape(-1, 2)
+        track = np.asarray(track_latlon, dtype=np.float64).reshape(-1, 2)
+        if route.size == 0 or track.size == 0:
+            return _INF
+        if len(track) > 1:
+            track = np.vstack([np.linspace(track[i], track[i + 1], samples)
+                               for i in range(len(track) - 1)])
+        cos_lat = math.cos(math.radians(float(np.mean(route[:, 0]))))
+        dlat = (route[:, None, 0] - track[None, :, 0]) * 111.0
+        dlon = (route[:, None, 1] - track[None, :, 1]) * 111.0 * cos_lat
+        d = np.sqrt(dlat ** 2 + dlon ** 2)
+        d = d[~np.isnan(d)]
+        return float(d.min()) if d.size else _INF
+    except Exception:
+        return _INF
+
+
+def classify_threat(cpa: float, predicted_crossings: int) -> str:
+    """HIGH if CPA < 5 km or the route crosses predicted risk>5 cells; MED if CPA < 10 km; else LOW."""
+    if cpa < 5.0 or predicted_crossings > 0:
+        return "HIGH"
+    if cpa < 10.0:
+        return "MED"
+    return "LOW"
+
+
+def suggest_reroute(risk_combined: Optional[np.ndarray], start: Tuple[int, int], goal: Tuple[int, int],
+                    base_path: List[Tuple[int, int]], predicted_grid: Optional[np.ndarray],
+                    risk_weight: float = 50.0) -> Optional[Tuple[List[Tuple[int, int]], float]]:
+    """
+    On a HIGH threat, re-run A* with the risk penalty doubled and offer the
+    result as a TEXT suggestion: returns (alt_path, delta_km) when the
+    alternative lowers predicted exposure, else None (no improvement, no
+    path, or any failure). The displayed route is never switched here.
+    """
+    try:
+        alt = astar(risk_combined, start, goal, risk_weight=risk_weight * 2.0)
+        if alt is None or not base_path:
+            return None
+        base_m = route_metrics(risk_combined, base_path, base_path, predicted_grid=predicted_grid)
+        alt_m = route_metrics(risk_combined, alt, base_path, predicted_grid=predicted_grid)
+        if alt_m['predicted_exposure'] < base_m['predicted_exposure'] - 1e-9:
+            return alt, alt_m['path_distance_km'] - base_m['path_distance_km']
+        return None
+    except Exception:
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -872,12 +1034,26 @@ if __name__ == "__main__":
     risk_grid = build_risk_grid(mask, GRID)
     print(f"Risk grid shape: {risk_grid.shape}, min={risk_grid.min():.2f}, max={risk_grid.max():.2f}")
 
+    print("Forecasting 24-h risk grid...")
+    wind_path = "data/wind_current.csv"
+    wind_df = pd.read_csv(wind_path) if os.path.exists(wind_path) else pd.DataFrame([
+        {"lat": -67.3, "lon": 60.1, "u_current": 0.1, "v_current": 0.08, "u_wind": 3.0, "v_wind": 2.0},
+        {"lat": -67.6, "lon": 60.5, "u_current": 0.12, "v_current": 0.05, "u_wind": 4.0, "v_wind": 2.5},
+    ])
+    drift_field = build_drift_field(wind_df)
+    risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+    risk_combined = np.maximum(risk_grid, risk_pred)
+    print(f"Drift field: {'ok' if drift_field is not None else 'none (predicted == current)'} | "
+          f"cells>5 now={int((risk_grid > 5).sum())} in 24h={int((risk_pred > 5).sum())}")
+    band_edges, band_src = kmeans_band_edges(risk_pred)
+    print(f"Concentration bands (%): {band_edges} (source: {band_src})")
+
     start = DEMO_START
     goal = DEMO_GOAL
     print(f"Start: {start}, Goal: {goal}")
 
-    print("Running A*...")
-    astar_path = astar(risk_grid, start, goal, risk_weight=50.0)
+    print("Running A* on combined (current | 24h predicted) risk...")
+    astar_path = astar(risk_combined, start, goal, risk_weight=50.0)
     if astar_path is None:
         print("A* found no path! Falling back to direct path.")
         astar_path = direct_path(risk_grid, start, goal)
@@ -889,8 +1065,13 @@ if __name__ == "__main__":
     print(f"Direct path length: {len(direct)}")
 
     print("Computing metrics...")
-    metrics = route_metrics(risk_grid, astar_path, direct)
+    metrics = route_metrics(risk_grid, astar_path, direct, predicted_grid=risk_pred)
     print(json.dumps(metrics, indent=2))
+    assert metrics['predicted_exposure'] >= metrics['current_exposure'], \
+        "forecast exposure must never be below current exposure (max-combine invariant)"
+    print(f"Exposure: current={metrics['current_exposure']:.3f} "
+          f"predicted_24h={metrics['predicted_exposure']:.3f} "
+          f"(predicted risk>5 cells on route: {metrics['predicted_crossings']})")
 
     # Scenario check: the demo only tells its story if the direct route actually
     # runs through ice (risk>5 crossings) and A* buys a 50-90% risk reduction.
@@ -921,6 +1102,16 @@ if __name__ == "__main__":
     drift_df = predict_iceberg_drift(sample_icebergs, sample_wind, hours=24.0)
     drift_list = drift_df[['pred_lat', 'pred_lon']].values.tolist()
     print(f"Drift predictions: {drift_list}")
+
+    print("Computing CPA / threat class...")
+    cpas = {int(row['id']): round(cpa_km(path_ll, [[row['lat'], row['lon']],
+                                                    [row['pred_lat'], row['pred_lon']]]), 2)
+            for _, row in drift_df.iterrows()}
+    min_cpa = min(cpas.values()) if cpas else _INF
+    threat = classify_threat(min_cpa, metrics['predicted_crossings'])
+    print(f"CPA per iceberg (km): {cpas} -> threat {threat}")
+    reroute = suggest_reroute(risk_combined, start, goal, astar_path, risk_pred) if threat == "HIGH" else None
+    print(f"Reroute suggestion: {('+%.1f km' % reroute[1]) if reroute else 'none'}")
 
     print("Generating strict JSON...")
     output = strict_json(start_ll, goal_ll, path_ll, metrics, drift_list)
