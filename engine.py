@@ -330,11 +330,19 @@ def _unet_segment(img: np.ndarray, model) -> np.ndarray:
 
 # ----------------------------------------------------------------------
 # 2. Ice detection
-def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.ndarray, int, str]:
+def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.ndarray, int, str, dict]:
     """
     Load image, segment ice, return (original_image, binary_mask,
-    ice_pixel_count, active_path) — active_path is "unet" or "otsu", so the
-    caller can honestly caption which inference path actually ran.
+    ice_pixel_count, active_path, diagnostics) — active_path is "unet" or
+    "otsu", so the caller can honestly caption which inference path actually
+    ran. diagnostics is {"otsu_threshold": float|None, "guard_status": str,
+    "coverage_pct": float}, all values already computed below — this only
+    stops discarding them, no decision logic changes. guard_status is one of
+    "unet_disabled" (use_unet=False), "weights_missing" (torch absent or
+    models/unet_weights.pth absent — load_unet_model doesn't itself
+    distinguish these two), "unet_failed" (weights loaded but inference
+    raised), "guard_rejected" (inference ran but coverage fell outside the
+    sanity band below), "unet_accepted".
 
     If use_unet and a trained SmallUNet is available (see load_unet_model),
     tries it first. Falls back to Gaussian blur + Otsu threshold +
@@ -349,6 +357,8 @@ def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.n
 
     mask = None
     active_path = "otsu"
+    otsu_threshold = None
+    guard_status = "unet_disabled" if not use_unet else "weights_missing"
     if use_unet:
         model = load_unet_model()
         if model is not None:
@@ -358,32 +368,45 @@ def detect_ice(image_path: str, use_unet: bool = True) -> Tuple[np.ndarray, np.n
                 if 0.01 <= coverage <= 0.60:
                     mask = candidate
                     active_path = "unet"
+                    guard_status = "unet_accepted"
+                else:
+                    guard_status = "guard_rejected"
             except Exception:
                 mask = None
+                guard_status = "unet_failed"
 
     if mask is None:
         blurred = cv2.GaussianBlur(img, (7, 7), 0)
-        _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        otsu_threshold, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         active_path = "otsu"
 
     ice_cells = int(np.count_nonzero(mask))
-    return img, mask, ice_cells, active_path
+    diagnostics = {
+        "otsu_threshold": float(otsu_threshold) if otsu_threshold is not None else None,
+        "guard_status": guard_status,
+        "coverage_pct": 100.0 * ice_cells / mask.size,
+    }
+    return img, mask, ice_cells, active_path, diagnostics
 
 
 # ----------------------------------------------------------------------
 # ML core: KMeans ice-class profiling (optional, internal-only — no new
 # output fields). Falls back to a flat risk value when unavailable.
-def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> np.ndarray:
+def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> Tuple[np.ndarray, Optional[dict]]:
     """
     Cluster icebergs by size (mass_kt, freeboard_m) into risk tiers via
     KMeans so bigger/taller icebergs stamp a higher risk value than smaller
-    ones. Returns one risk value per row in [7, 10]; falls back to a flat
-    10.0 per row when scikit-learn is unavailable, there are too few rows to
-    cluster, the required columns are missing, or clustering fails for any
-    reason — this must never crash risk-grid construction.
+    ones. Returns (weights, diagnostics): `weights` is one risk value per row
+    in [7, 10], unchanged from before; falls back to a flat 10.0 per row
+    (diagnostics=None) when scikit-learn is unavailable, there are too few
+    rows to cluster, the required columns are missing, or clustering fails
+    for any reason — this must never crash risk-grid construction.
+    `diagnostics` (None on any fallback) is {"centroids": [[mass_kt, freeboard_m], ...]
+    in original units ordered smallest-to-largest tier, "tier_multipliers": [...]}
+    — both already computed below and previously discarded on the spot.
 
     mass_kt (hundreds-to-thousands) and freeboard_m (single-to-double digits)
     are on wildly different numeric scales; KMeans uses Euclidean distance, so
@@ -396,7 +419,7 @@ def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> np.n
     n = len(icebergs_df)
     flat = np.full(n, 10.0)
     if KMeans is None or n < n_clusters or not {'mass_kt', 'freeboard_m'}.issubset(icebergs_df.columns):
-        return flat
+        return flat, None
     try:
         features = icebergs_df[['mass_kt', 'freeboard_m']].to_numpy(dtype=np.float64)
         col_max = np.where(features.max(axis=0) > 0, features.max(axis=0), 1.0)  # guard zero
@@ -407,19 +430,28 @@ def _kmeans_risk_weights(icebergs_df: pd.DataFrame, n_clusters: int = 3) -> np.n
         order = np.argsort(cluster_means)  # smallest cluster first
         tier_risk = np.linspace(7.0, 10.0, n_clusters)
         risk_by_cluster = {cluster: tier_risk[rank] for rank, cluster in enumerate(order)}
-        return np.array([risk_by_cluster[label] for label in km.labels_])
+        weights = np.array([risk_by_cluster[label] for label in km.labels_])
+        centroids_real = km.cluster_centers_ * col_max  # back to original mass_kt/freeboard_m units
+        diagnostics = {
+            "centroids": [centroids_real[c].tolist() for c in order],
+            "tier_multipliers": tier_risk.tolist(),
+        }
+        return weights, diagnostics
     except Exception:
-        return flat
+        return flat, None
 
 
 # ----------------------------------------------------------------------
 # 3. Build risk grid (0..10)
 def build_risk_grid(mask: np.ndarray, size: int = GRID,
                      icebergs_df: Optional[pd.DataFrame] = None,
-                     use_kmeans: bool = True) -> np.ndarray:
+                     use_kmeans: bool = True) -> Tuple[np.ndarray, Optional[dict]]:
     """
     Resize mask to (size,size), convert to float, set >0 to 10, optionally
     stamp known iceberg positions in as hard-risk cells, blur, clip to 0..10.
+    Returns (risk_grid, kmeans_diagnostics) — kmeans_diagnostics is whatever
+    _kmeans_risk_weights produced (None when it fell back to a flat weight,
+    or icebergs_df wasn't usable), previously discarded, now passed through.
 
     icebergs_df is optional and defensive: a missing df, an empty df, a df
     without lat/lon columns, or a row with a bad value are all tolerated —
@@ -429,6 +461,7 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
     """
     resized = cv2.resize(mask.astype(np.float32), (size, size), interpolation=cv2.INTER_AREA)
     risk = np.where(resized > 0, 10.0, 0.0)
+    kmeans_diagnostics = None
 
     if icebergs_df is not None and len(icebergs_df) > 0 \
             and {'lat', 'lon'}.issubset(icebergs_df.columns):
@@ -441,7 +474,11 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
             lon_span = (LON_MAX - LON_MIN) or 1.0
             rs = np.clip(np.round(size * (1.0 - (lats[valid] - LAT_MIN))), 0, size - 1).astype(int)
             cs = np.clip(np.round(size * (lons[valid] - LON_MIN) / lon_span), 0, size - 1).astype(int)
-            weights = _kmeans_risk_weights(icebergs_df)[valid] if use_kmeans else np.full(valid.sum(), 10.0)
+            if use_kmeans:
+                weights_all, kmeans_diagnostics = _kmeans_risk_weights(icebergs_df)
+                weights = weights_all[valid]
+            else:
+                weights = np.full(valid.sum(), 10.0)
             # np.maximum.at, not risk[rs, cs] = weights: plain fancy-index assignment lets
             # a later iceberg in array order silently overwrite an earlier one's higher
             # risk when two round to the same cell. maximum.at is order-independent.
@@ -449,7 +486,7 @@ def build_risk_grid(mask: np.ndarray, size: int = GRID,
 
     risk = cv2.GaussianBlur(risk, (5, 5), 0)
     risk = np.clip(risk, 0.0, 10.0)
-    return risk
+    return risk, kmeans_diagnostics
 
 
 # ----------------------------------------------------------------------
@@ -487,20 +524,28 @@ def build_drift_field(wind_df: Optional[pd.DataFrame], size: int = GRID) -> Opti
 
 
 def predict_risk_grid(risk_grid: Optional[np.ndarray], drift_field: Optional[np.ndarray],
-                      hours: float = 24.0) -> Optional[np.ndarray]:
+                      hours: float = 24.0) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Forecast the risk grid `hours` ahead. Each cell's risk is carried by its
     drift vector (displacement = (current + 0.03*wind) * hours, 1 deg ~ 111 km,
     longitude scaled by cos(lat)), shifted a whole number of cells and clamped
-    to the grid edge. Cells landing on the same target keep the maximum, and
-    the result is max-combined with the present grid so forecast risk never
-    drops below current risk (ice here now is still a hazard even if the field
-    says it moves on). Never raises; drift_field=None returns a copy.
+    to the grid edge. Cells landing on the same target keep the maximum.
+
+    Returns (combined, advected): `combined` is max-combined with the present
+    grid so forecast risk never drops below current risk (ice here now is
+    still a hazard even if the field says it moves on) — this is what every
+    existing caller already used under the old single-value return, unchanged.
+    `advected` is the pure pre-max forecast (no floor from the present grid) —
+    previously computed and discarded on the spot; exposed now as the third,
+    numerically distinct grid for a "current / predicted / combined" display
+    (combined and this file's old single return value are the same number,
+    since combined = max(risk_grid, advected) already folds in the present
+    grid). Never raises; drift_field=None returns (risk_grid.copy(), None).
     """
     if risk_grid is None:
-        return None
+        return None, None
     if drift_field is None or drift_field.shape[:2] != risk_grid.shape:
-        return risk_grid.copy()
+        return risk_grid.copy(), None
     try:
         rows, cols = risk_grid.shape
         rr, cc = np.meshgrid(np.arange(rows), np.arange(cols), indexing='ij')
@@ -515,9 +560,9 @@ def predict_risk_grid(risk_grid: Optional[np.ndarray], drift_field: Optional[np.
         tc = np.clip(np.round(cc + dlon * cols / lon_span), 0, cols - 1).astype(int)
         advected = np.zeros_like(risk_grid)
         np.maximum.at(advected, (tr.ravel(), tc.ravel()), risk_grid.ravel())
-        return np.maximum(risk_grid, advected)
+        return np.maximum(risk_grid, advected), advected
     except Exception:
-        return risk_grid.copy()
+        return risk_grid.copy(), None
 
 
 def kmeans_band_edges(risk_predicted: Optional[np.ndarray], n_bands: int = 5) -> Tuple[List[float], str]:
@@ -1064,8 +1109,8 @@ if __name__ == "__main__":
         _results = []
         for _seed, _start, _goal in _configs:
             make_synthetic_sar(_sanity_sar, size=400, seed=_seed)
-            _, _mask, _, _ = detect_ice(_sanity_sar)
-            _risk_grid = build_risk_grid(_mask, GRID)
+            _, _mask, _, _, _ = detect_ice(_sanity_sar)
+            _risk_grid, _ = build_risk_grid(_mask, GRID)
             _path = astar(_risk_grid, _start, _goal, risk_weight=50.0)
             _direct = direct_path(_risk_grid, _start, _goal)
             if _path is None:
@@ -1094,12 +1139,13 @@ if __name__ == "__main__":
         print("Detecting ice...")
         resolved = resolve_sar_path(sar_path)
         print("Source: real Sentinel-1 crop" if resolved != sar_path else "Source: synthetic sample")
-        orig_img, mask, ice_cells, ice_path = detect_ice(sar_path)
+        orig_img, mask, ice_cells, ice_path, ice_diag = detect_ice(sar_path)
         print(f"Ice pixels: {ice_cells} (active path: {ice_path})")
+        print(f"Otsu threshold: {ice_diag['otsu_threshold']} | guard status: {ice_diag['guard_status']}")
         print(f"Drift source: {'ridge (models/drift_model.joblib)' if load_drift_model() else 'physics formula (fallback)'}")
 
         print("Building risk grid...")
-        risk_grid = build_risk_grid(mask, GRID)
+        risk_grid, _kmeans_diag = build_risk_grid(mask, GRID)
         print(f"Risk grid shape: {risk_grid.shape}, min={risk_grid.min():.2f}, max={risk_grid.max():.2f}")
 
         print("Forecasting 24-h risk grid...")
@@ -1109,7 +1155,7 @@ if __name__ == "__main__":
             {"lat": -67.6, "lon": 60.5, "u_current": 0.12, "v_current": 0.05, "u_wind": 4.0, "v_wind": 2.5},
         ])
         drift_field = build_drift_field(wind_df)
-        risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+        risk_pred, _risk_advected = predict_risk_grid(risk_grid, drift_field, hours=24.0)
         risk_combined = np.maximum(risk_grid, risk_pred)
         print(f"Drift field: {'ok' if drift_field is not None else 'none (predicted == current)'} | "
               f"cells>5 now={int((risk_grid > 5).sum())} in 24h={int((risk_pred > 5).sum())}")
@@ -1208,7 +1254,7 @@ if __name__ == "__main__":
         _bergs_path = "data/icebergs.csv"
         if os.path.exists(_bergs_path):
             _bergs = pd.read_csv(_bergs_path)
-            _w = _kmeans_risk_weights(_bergs)
+            _w, _ = _kmeans_risk_weights(_bergs)
             for _i, _row in _bergs.iterrows():
                 print(f"  id={int(_row['id']):>2}  mass_kt={_row['mass_kt']:>8.2f}  "
                       f"freeboard_m={_row['freeboard_m']:>6.2f}  tier_weight={_w[_i]:.1f}")

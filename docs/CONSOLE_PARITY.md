@@ -15,9 +15,17 @@ mirrors — check both sides whenever either file changes.
 | `_compute_route` (app.py:364-481ish) | `_compute_route()` |
 | `_along_route_km` / `_km_between` | same names |
 | `_dm_to_decimal` / `_parse_nmea_line` / `_nmea_probe` | same names |
-| `_concentration_rgba` / `_build_map` | same names (plus an empty-state AOI-only map when no route exists yet, which app.py never needs since it only renders the map once `route_data` is set) |
 | M4 status fragment (app.py's 4 dots) | `GET /status`'s `watcher`/`bus`/`nmea`/`model` fields |
 | M5 stale banner | `GET /status`'s `drop.age_h`/`drop.stale` |
+
+**v3 update**: `_concentration_rgba`/`_build_map` are no longer separately
+duplicated in each file — both `app.py` and `api.py` now import the same
+`mapview.py` (new, shared module) and call `mapview.build_map(rd,
+leaflet_prefix=..., ...)`. The only real difference between the two
+callers (the Leaflet static-mount prefix: `/app/static` for Streamlit,
+`/static` for the console) is a parameter, not a second copy of the
+logic. This removes the one place this file previously named as
+duplicated-by-necessity.
 
 ## Parity matrix
 
@@ -41,7 +49,44 @@ mirrors — check both sides whenever either file changes.
 - `/detect` combines F1 (ingest) and F2 (detect) into one action; app.py
   has them as two separate buttons for a judge-facing, step-by-step demo.
   See `docs/API_CONTRACT.md`'s note on this.
-- The console has no image-preview panel (F2's "Original SAR" / "Detected
-  Ice Mask" side-by-side images) — no endpoint serves either image, since
-  the locked endpoint contract doesn't include one. `n_cells`/
-  `coverage_pct`/captions are all present; the visual mask itself is not.
+
+(The v2-era "no image-preview panel" gap is resolved this mission — the
+console's DETECT tab now shows both images via `/detect`'s
+`orig_png_b64`/`mask_png_b64` fields, which app.py's F2 doesn't expose
+since `st.image` renders the array directly with no need to encode it.)
+
+## v3 completeness matrix (console-side; app.py's own gate is narrower — see below)
+
+Every row is a `[SHOWN]`/`[WIRE]`/`[ORPHAN]` item from this mission's own
+completeness audit; "panel" names the console tab, per `docs/API_CONTRACT.md`.
+
+| Engine output | Console panel | Verified |
+|---|---|---|
+| SAR image vs. detected mask | DETECT | **PASS** — side-by-side, same frame treatment |
+| Coverage % (both clients now — app.py gained this too, not just console) | DETECT + app.py F2 caption | **PASS** |
+| Fallback reason (unet_disabled / weights_missing / unet_failed / guard_rejected / unet_accepted) | DETECT | **PASS** — replaces the old binary unet/otsu-only tag |
+| Inference time | DETECT | **PASS** — measured in `api.py`, not engine.py, per the mission's own instruction |
+| Otsu threshold + histogram | DETECT | **PASS** — histogram bars + a marker line at the threshold |
+| Coverage-guard status | DETECT | **PASS** — same field as fallback reason |
+| Risk-grid heatmap: current / predicted / pure-advection | FORECAST | **PASS** — 3 visually distinct images confirmed (predicted is max-floored by current, pure advection is not — see `engine.predict_risk_grid`'s docstring) |
+| KMeans tier centroids + multipliers | FORECAST | **PASS** — legend strip under the current-grid heatmap |
+| Per-iceberg drift table (id/mass/freeboard/now/+24h/vector km) | FORECAST | **PASS** |
+| Ridge status (active + R² + provenance) | FORECAST | **PASS** — `r2: 0.9999...` read live from `drift_training_report.json` |
+| Full route metrics table (all 11 `route_metrics` keys) | ROUTE | **PASS** |
+| CPA-per-berg table, including LOW tier | ROUTE | **PASS** — previously only HIGH/MED got individual lines |
+| Reroute delta + the alternate path's own geometry | ROUTE (delta) + map (geometry, dashed grey line) | **PASS** |
+| Drop receipts + quarantine log | DATA | **PASS** |
+| NSIDC badge + coverage-mapping detail | DATA | **PASS** |
+| Rejected-row count | FORECAST | **PASS** — computed adapter-side from the same NaN check `build_risk_grid` uses internally |
+| Model registry (weights present? Dice? INT8?) | SYSTEM | **PASS** — Dice/INT8 honestly reported as "not yet measured," not fabricated |
+| Offline-proof (telemetry, tiles, zero-CDN, bind address) | SYSTEM | **PASS** |
+| Commit hash | SYSTEM | **PASS** — `git rev-parse --short HEAD`, "unknown" on failure |
+| Sim Deck (mode, counters, countdown, NMEA/bus chips, Drop Now) | OPS | **PASS** — start/stop idempotency confirmed twice in each direction |
+
+**app.py's own gate is narrower by design**: per this mission's plan, the
+completeness gate targets the console specifically (your own Step 1b
+wording: "shown/missing **in console today**"). app.py only gained the
+shared map builder (mandatory) plus `coverage_pct` and the
+`use_container_width` map-sizing fix (both essentially free while already
+touching those exact lines) — it was not given the 6-tab redesign or the
+rest of the new data panels above, which remain console-only.

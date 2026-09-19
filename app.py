@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import json
 
 import bus  # M3: event bus -- kafka-python-ng optional inside bus.py itself; this import is always safe
+import mapview  # v3: shared map builder -- see mapview.py; the console (api.py) uses the same module
 
 # Offline navigation engine imports
 from engine import (
@@ -322,9 +323,9 @@ if st.button("🔍 Detect Ice (U-Net / OpenCV Surrogate)"):
     else:
         sar_path = "data/sar_sample.png"
         try:
-            orig_img, mask_img, n_cells, ice_path = detect_ice(sar_path)
+            orig_img, mask_img, n_cells, ice_path, ice_diag = detect_ice(sar_path)
 
-            st.session_state.risk_grid = build_risk_grid(
+            st.session_state.risk_grid, _ = build_risk_grid(
                 mask_img, GRID, icebergs_df=st.session_state.icebergs_df)
             st.session_state.ice_detected = True
             st.session_state.ice_error = None
@@ -337,6 +338,7 @@ if st.button("🔍 Detect Ice (U-Net / OpenCV Surrogate)"):
                 "orig": orig_img,
                 "mask": mask_img,
                 "n_cells": n_cells,
+                "coverage_pct": ice_diag["coverage_pct"],
                 "source": ("Source: real Sentinel-1 crop" if _src != sar_path
                            else "Source: synthetic sample"),
                 "active_path": ("Active model: SmallUNet (trained weights)" if ice_path == "unet"
@@ -357,7 +359,9 @@ if st.session_state.ice_view is not None:
         st.image(_iv["mask"], caption="Detected Ice Mask")
     st.caption(_iv["source"])
     st.caption(_iv["active_path"])
-    st.metric("Ice cells", _iv["n_cells"])
+    _c1, _c2 = st.columns(2)
+    _c1.metric("Ice cells", _iv["n_cells"])
+    _c2.metric("Coverage", f"{_iv['coverage_pct']:.1f}%")
 if st.session_state.ice_error:
     st.error(st.session_state.ice_error)
 
@@ -444,7 +448,7 @@ def _compute_route(start_coord, goal_coord) -> bool:
         # the drift field, max-combine, and plan against the combination so
         # the route avoids ice that will be there tomorrow, not just today.
         drift_field = build_drift_field(st.session_state.wind_df)
-        risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+        risk_pred, _ = predict_risk_grid(risk_grid, drift_field, hours=24.0)
         risk_combined = np.maximum(risk_grid, risk_pred) if risk_grid is not None else None
         band_edges, band_src = kmeans_band_edges(risk_pred)
 
@@ -598,67 +602,17 @@ if st.button("⚓ Compute Risk-Aware Route (Modified A* + p(n))"):
             st.session_state.last_route_start_ll = grid_to_latlon(*start_coord)  # M2: drift-hysteresis baseline
 
 
-# Ice-blue ramp, one colour per concentration band (light -> deep).
-_BAND_RGB = [(198, 226, 255), (140, 196, 250), (86, 152, 236), (44, 98, 208), (16, 44, 128)]
-
-
-def _concentration_rgba(risk_pred, edges) -> np.ndarray:
-    """Predicted risk grid (0..10) -> RGBA uint8 image banded by concentration
-    (%); open water (0 %) stays transparent. Pure numpy: folium base64-inlines
-    the array as a PNG, so the overlay needs no file, no CDN, no matplotlib."""
-    conc = np.clip(np.asarray(risk_pred, dtype=np.float64) * 10.0, 0.0, 100.0)
-    band = np.digitize(conc, edges)  # 0..len(edges)
-    rgba = np.zeros(conc.shape + (4,), dtype=np.uint8)
-    for k, rgb in enumerate(_BAND_RGB):
-        rgba[band == k, :3] = rgb
-    rgba[..., 3] = np.where(conc > 0.0, 255, 0).astype(np.uint8)
-    return rgba
-
-
 def _build_map(rd: dict) -> folium.Map:
-    """Build a brand-new folium.Map from plain route data. Called once per
-    script run — a Map object is never cached or reused across reruns."""
-    # True offline mode: tiles=None means the browser never requests basemap
-    # images from any CDN. A flat rectangle stands in for the ocean, and the
-    # bundled schematic coastline gives it geography.
-    m = folium.Map(
-        location=[-67.5, 60.2],
-        zoom_start=8,
-        tiles=None,
+    """Thin wrapper around the shared mapview.build_map -- see mapview.py.
+    Used identically by api.py's console; extracted this mission so both
+    clients render the exact same map (pins, route casing/glow, dark
+    Leaflet chrome, AOI-fit view) from one place instead of two
+    independently-maintained copies."""
+    return mapview.build_map(
+        rd, leaflet_prefix="/app/static",
+        lat_min=LAT_MIN, lat_max=LAT_MAX, lon_min=LON_MIN, lon_max=LON_MAX,
+        grid_to_latlon=grid_to_latlon,
     )
-    folium.Rectangle(
-        bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
-        color="#1b2a4a", fill=True, fill_opacity=0.6, weight=0,
-    ).add_to(m)
-    coast_path = "data/coast.geojson"
-    if os.path.exists(coast_path):  # bundled locally; folium inlines it, no fetch
-        folium.GeoJson(
-            coast_path, name="Coastline",
-            style_function=lambda f: {"color": "#9aa4b2", "weight": 1.5, "fillOpacity": 0},
-        ).add_to(m)
-
-    # 24-h predicted ice concentration (GIS overlay). Row 0 of the grid is the
-    # northern edge (see grid_to_latlon), matching origin="upper".
-    if rd.get("risk_pred") is not None:
-        folium.raster_layers.ImageOverlay(
-            image=_concentration_rgba(rd["risk_pred"], rd.get("band_edges") or [20, 40, 60, 80]),
-            bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
-            opacity=0.45, origin="upper", mercator_project=False,
-            name="Predicted ice concentration (24 h)",
-        ).add_to(m)
-
-    for curr_loc, pred_loc in rd["icebergs"]:
-        folium.CircleMarker(curr_loc, color='red', radius=4, fill=True).add_to(m)
-        folium.CircleMarker(pred_loc, color='orange', radius=4, fill=True).add_to(m)
-        folium.PolyLine([curr_loc, pred_loc], color='orange', dash_array='5', weight=2).add_to(m)
-
-    # Map grid coords to lat/lon for mapping
-    opt_latlon = [grid_to_latlon(r, c) for r, c in rd["path"]]
-    dir_latlon = [grid_to_latlon(r, c) for r, c in rd["direct"]]
-
-    folium.PolyLine(opt_latlon, color='green', weight=4, opacity=0.8).add_to(m)
-    folium.PolyLine(dir_latlon, color='red', dash_array='10', weight=2, opacity=0.6).add_to(m)
-    return m
 
 
 # Page-level render: outside every button, so a rerun redraws the same map
@@ -680,7 +634,13 @@ if _rd is not None:
     c4.metric("Risk Reduction %", round(_metrics['risk_reduction_pct'], 1))
     c5.metric("Fuel/Time Trade-off", f"{round(_metrics['fuel_penalty_pct'], 1)}%")
 
-    st_folium(_build_map(_rd), width=1200, height=500,
+    # use_container_width instead of a fixed 1200px: on a narrower laptop
+    # screen (common once the sidebar is open) a hardcoded width clipped
+    # or forced horizontal scrolling -- a slop-audit finding this mission.
+    # height bumped to match the AOI's own portrait aspect ratio in
+    # Mercator at this latitude, for the same reason console/style.css's
+    # map panel did (less letterboxing once fit to the AOI's bounds).
+    st_folium(_build_map(_rd), height=560, use_container_width=True,
               returned_objects=[], key="nav_map")
 
     st.caption("Forecast horizon: 24 h | overlay = predicted concentration")
@@ -689,7 +649,7 @@ if _rd is not None:
         _lo = [0] + list(_e)
         _hi = list(_e) + [100]
         _sw = "".join(
-            f'<span style="display:inline-block;width:12px;height:12px;background:rgb{_BAND_RGB[i]};'
+            f'<span style="display:inline-block;width:12px;height:12px;background:rgb{mapview.BAND_RGB[i]};'
             f'border:1px solid #888;margin:0 4px 0 10px;vertical-align:middle"></span>'
             f'{_lo[i]:.0f}–{_hi[i]:.0f} %'
             for i in range(5))

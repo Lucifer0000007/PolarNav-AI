@@ -4,7 +4,7 @@ api.py - Bridge Console API (SIH26059, additive-only, app.py untouched).
 A thin FastAPI adapter in front of engine.py's existing math, for the new
 vanilla-JS console (console/*). Every number this API returns comes from
 the exact same engine.py functions app.py already calls -- no new math
-lives here, only orchestration + JSON shaping.
+lives here, only orchestration + JSON/SVG shaping + wall-clock timing.
 
 Why this file duplicates a handful of small app.py helpers (the folium map
 builder, the NMEA loopback probe, the along-route-distance helper, the
@@ -15,6 +15,16 @@ to reuse its behavior here is to port it verbatim, not to share code with
 it. docs/CONSOLE_PARITY.md names exactly which app.py line ranges each
 function below mirrors, so a future app.py edit knows to check here too.
 
+v3 additions beyond the original Bridge Console: richer /detect and a new
+/forecast (surfacing engine.py diagnostics that were previously computed
+and discarded -- see engine.py's own docstrings for exactly which),
+/nsidc, /drop/receipts, /system, and a Sim Deck (/sims/status,
+/sims/start, /sims/stop, /drop/now) that manages the 3 sim scripts as
+guarded subprocesses via a PID file. Every engine.py signature this file
+now unpacks differently was extended (not behaviorally changed) this same
+mission -- see engine.py's own docstrings for detect_ice, build_risk_grid,
+_kmeans_risk_weights and predict_risk_grid.
+
 State model: this is a single-vessel, single-operator offline console, not
 a multi-tenant web service, so "session state" is one process-wide dict
 (_state below) -- the same module-level-globals idiom bus.py already uses
@@ -24,14 +34,20 @@ Binds 127.0.0.1:8000 only (see console.bat) -- loopback-only by the same
 source-level convention nmea_sim.py and bus.py already use, matching this
 repo's actual "offline" enforcement point (Python constants, not config).
 """
+import base64
+import glob
 import json
 import math
 import os
+import shutil
 import socket
+import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import cv2
 import numpy as np
 import pandas as pd
 import folium
@@ -41,15 +57,18 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 import bus  # existing module, unmodified -- same dual-write event log app.py uses
+import mapview  # shared map builder -- see mapview.py; app.py uses the same module
 
 from engine import (
     make_synthetic_sar, detect_ice, build_risk_grid, predict_iceberg_drift,
     astar, direct_path, route_metrics, save_route, load_routes, strict_json,
-    grid_to_latlon, resolve_sar_path, sample_seaice_row,
-    build_drift_field, predict_risk_grid, kmeans_band_edges,
+    grid_to_latlon, resolve_sar_path, sample_seaice_row, extent_to_coverage,
+    build_drift_field, predict_risk_grid, kmeans_band_edges, load_drift_model,
     cpa_km, classify_threat, suggest_reroute,
     GRID, LAT_MIN, LAT_MAX, LON_MIN, LON_MAX,
 )
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__)) or "."
 
 # ---- offline Leaflet override -- mirrors app.py:98-99 exactly, but pointed
 # at this process's OWN static mount (Streamlit's /app/static/ prefix is
@@ -75,11 +94,24 @@ _state: dict[str, Any] = {
     "wind_df": _DEFAULT_WIND,
     "seaice_context": None,
     "risk_grid": None,
-    "ice_view": None,          # {n_cells, coverage_pct, source, active_path}
-    "route_data": None,        # mirrors app.py's session_state.route_data shape
-    "last_drop_at": None,      # UTC datetime; drives /status's drop.age_h/stale
+    "kmeans_diagnostics": None,  # {centroids, tier_multipliers} from the last /detect, or None
+    "ice_view": None,           # see _detect()'s docstring for the full shape
+    "route_data": None,         # mirrors app.py's session_state.route_data shape
+    "last_drop_at": None,       # UTC datetime; drives /status's drop.age_h/stale
     "last_route_start_ll": None,
 }
+
+# Sim Deck process-management state.
+RUNTIME_DIR = os.path.join(REPO_ROOT, "runtime")
+PIDS_PATH = os.path.join(RUNTIME_DIR, "sims.pids")
+SIM_SCRIPTS = {
+    "satcom": ["satcom_sim.py", "--interval", "20"],
+    "watcher": ["drop_watcher.py"],
+    "nmea": ["nmea_sim.py"],
+}
+_SIM_INTERVAL_S = 20.0
+_sim_started_at: dict[str, float] = {}  # in-process only; used for the OPS countdown ring, not correctness
+_drop_now_counter = 0
 
 
 # -----------------------------------------------------------------------------
@@ -110,6 +142,7 @@ class RouteResponse(BaseModel):
     goal_ll: tuple[float, float]
     metrics: dict[str, Any]
     min_cpa_km: Optional[float]
+    cpa_table: list[dict[str, Any]]
     alerts: list[AlertItem]
     notes: list[AlertItem]
     reroute_delta_km: Optional[float]
@@ -213,57 +246,52 @@ def _along_route_km(route_ll, track_ll, samples: int = 25):
         return None
 
 
-_BAND_RGB = [(198, 226, 255), (140, 196, 250), (86, 152, 236), (44, 98, 208), (16, 44, 128)]
-
-
-def _concentration_rgba(risk_pred, edges) -> np.ndarray:
-    """Mirrors app.py's _concentration_rgba verbatim."""
-    conc = np.clip(np.asarray(risk_pred, dtype=np.float64) * 10.0, 0.0, 100.0)
-    band = np.digitize(conc, edges)
-    rgba = np.zeros(conc.shape + (4,), dtype=np.uint8)
-    for k, rgb in enumerate(_BAND_RGB):
-        rgba[band == k, :3] = rgb
-    rgba[..., 3] = np.where(conc > 0.0, 255, 0).astype(np.uint8)
-    return rgba
-
-
 def _build_map(rd: Optional[dict]) -> folium.Map:
-    """Mirrors app.py's _build_map verbatim, plus an empty-state AOI-only
-    map (rectangle + coastline, no route/icebergs) when rd is None -- the
-    console can request /map before any route has been computed."""
-    m = folium.Map(location=[-67.5, 60.2], zoom_start=8, tiles=None)
-    folium.Rectangle(
-        bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
-        color="#1b2a4a", fill=True, fill_opacity=0.6, weight=0,
-    ).add_to(m)
-    coast_path = "data/coast.geojson"
-    if os.path.exists(coast_path):
-        folium.GeoJson(
-            coast_path, name="Coastline",
-            style_function=lambda f: {"color": "#9aa4b2", "weight": 1.5, "fillOpacity": 0},
-        ).add_to(m)
+    """Thin wrapper around the shared mapview.build_map -- see mapview.py
+    for the actual construction (used identically by app.py)."""
+    return mapview.build_map(
+        rd, leaflet_prefix="/static",
+        lat_min=LAT_MIN, lat_max=LAT_MAX, lon_min=LON_MIN, lon_max=LON_MAX,
+        grid_to_latlon=grid_to_latlon,
+    )
 
-    if rd is None:
-        return m
 
-    if rd.get("risk_pred") is not None:
-        folium.raster_layers.ImageOverlay(
-            image=_concentration_rgba(rd["risk_pred"], rd.get("band_edges") or [20, 40, 60, 80]),
-            bounds=[[LAT_MIN, LON_MIN], [LAT_MAX, LON_MAX]],
-            opacity=0.45, origin="upper", mercator_project=False,
-            name="Predicted ice concentration (24 h)",
-        ).add_to(m)
+def _encode_png_b64(img: np.ndarray) -> str:
+    """Encodes a numpy image array as a base64 PNG data string -- pure
+    formatting, no math, so the DETECT panel can show the SAR/mask images
+    the engine already produced without a separate image-serving route."""
+    try:
+        ok, buf = cv2.imencode(".png", img)
+        return base64.b64encode(buf.tobytes()).decode("ascii") if ok else ""
+    except Exception:
+        return ""
 
-    for curr_loc, pred_loc in rd["icebergs"]:
-        folium.CircleMarker(curr_loc, color='red', radius=4, fill=True).add_to(m)
-        folium.CircleMarker(pred_loc, color='orange', radius=4, fill=True).add_to(m)
-        folium.PolyLine([curr_loc, pred_loc], color='orange', dash_array='5', weight=2).add_to(m)
 
-    opt_latlon = [grid_to_latlon(r, c) for r, c in rd["path"]]
-    dir_latlon = [grid_to_latlon(r, c) for r, c in rd["direct"]]
-    folium.PolyLine(opt_latlon, color='green', weight=4, opacity=0.8).add_to(m)
-    folium.PolyLine(dir_latlon, color='red', dash_array='10', weight=2, opacity=0.6).add_to(m)
-    return m
+def _grid_to_svg(grid: Optional[np.ndarray], edges: list) -> Optional[str]:
+    """Thin wrapper around the shared mapview.grid_to_svg_heatmap."""
+    return mapview.grid_to_svg_heatmap(grid, edges)
+
+
+def _ridge_status() -> dict:
+    """Whether Ridge is active, plus its held-out R^2 and provenance label
+    -- reads an existing engine.py function and an existing report file
+    that nothing in either UI reads at runtime today. No engine.py change."""
+    try:
+        active = load_drift_model() is not None
+    except Exception:
+        active = False
+    r2 = None
+    provenance = "not yet measured"
+    try:
+        report_path = os.path.join(REPO_ROOT, "drift_training_report.json")
+        if os.path.exists(report_path):
+            with open(report_path, encoding="utf-8") as f:
+                report = json.load(f)
+            r2 = report.get("heldout_r2_ridge")
+            provenance = "synthetic physics samples — pipeline certification, not observed data"
+    except Exception:
+        pass
+    return {"active": active, "r2": r2, "provenance": provenance}
 
 
 def _ingest() -> dict:
@@ -337,35 +365,109 @@ def _ingest() -> dict:
                 "sar_path": sar_path, "error": f"Satellite data simulation failed: {e}"}
 
 
+_GUARD_REASON = {
+    "unet_disabled": "SmallUNet not requested for this call.",
+    "weights_missing": "No trained weights found (or torch unavailable) — using Otsu.",
+    "unet_failed": "SmallUNet inference raised an exception — using Otsu.",
+    "guard_rejected": "SmallUNet coverage fell outside the accepted 1–60% band — using Otsu.",
+    "unet_accepted": "SmallUNet accepted; Otsu not needed.",
+}
+
+
 def _detect(sar_path: str) -> dict:
-    """Mirrors app.py's F2 button body verbatim (app.py:319-348), including
-    its exact hardcoded sar_path="data/sar_sample.png" quirk (F2 never
-    reads a live receipt's own sar_path, even right after a live /detect
-    ingest) -- kept as-is for true behavioral parity with app.py, not
-    'fixed', since app.py itself is out of scope to change."""
+    """Mirrors app.py's F2 button body (app.py:319-348), including its
+    exact hardcoded sar_path="data/sar_sample.png" quirk (F2 never reads a
+    live receipt's own sar_path) -- kept as-is for true behavioral parity
+    with app.py, not 'fixed'. Extended this mission with everything
+    detect_ice/build_risk_grid now additionally return: Otsu threshold,
+    guard status + a human fallback reason, coverage %, inference time
+    (measured here, in the adapter, per this mission's own instruction --
+    not inside engine.py), a 32-bin intensity histogram of the original
+    image (a plain numpy summary stat, not new decision logic), and base64
+    PNG previews of the original image and mask so the console's DETECT
+    tab can show them without a separate image-serving endpoint."""
     sar_path = "data/sar_sample.png"
-    orig_img, mask_img, n_cells, ice_path = detect_ice(sar_path)
-    _state["risk_grid"] = build_risk_grid(mask_img, GRID, icebergs_df=_state["icebergs_df"])
-    try:
-        coverage_pct = 100.0 * float(np.count_nonzero(mask_img)) / float(mask_img.size)
-    except Exception:
-        coverage_pct = 0.0
+    t0 = time.perf_counter()
+    orig_img, mask_img, n_cells, ice_path, ice_diag = detect_ice(sar_path)
+    inference_ms = (time.perf_counter() - t0) * 1000.0
+    _state["risk_grid"], _state["kmeans_diagnostics"] = build_risk_grid(
+        mask_img, GRID, icebergs_df=_state["icebergs_df"])
     _src = resolve_sar_path(sar_path)
+    hist_counts, _ = np.histogram(orig_img, bins=32, range=(0, 255))
+
     ice_view = {
         "n_cells": int(n_cells),
-        "coverage_pct": coverage_pct,
+        "coverage_pct": ice_diag["coverage_pct"],
         "source": "Source: real Sentinel-1 crop" if _src != sar_path else "Source: synthetic sample",
         "active_path": ("Active model: SmallUNet (trained weights)" if ice_path == "unet"
                          else "Active model: OpenCV Otsu (fallback)"),
+        "guard_status": ice_diag["guard_status"],
+        "fallback_reason": _GUARD_REASON.get(ice_diag["guard_status"], ""),
+        "otsu_threshold": ice_diag["otsu_threshold"],
+        "inference_ms": inference_ms,
+        "histogram": hist_counts.tolist(),
+        "orig_png_b64": _encode_png_b64(orig_img),
+        "mask_png_b64": _encode_png_b64(mask_img),
     }
     _state["ice_view"] = ice_view
     return ice_view
 
 
+def _forecast_bundle() -> dict:
+    """Everything the FORECAST tab needs, independent of whether a route
+    has been computed yet (only needs an /detect to have run). Never
+    raises -- returns {"error": ...} on failure."""
+    try:
+        icebergs_df = _state["icebergs_df"]
+        wind_df = _state["wind_df"]
+        risk_grid = _state["risk_grid"]
+
+        dropped_count = 0
+        if not icebergs_df.empty and {"lat", "lon"}.issubset(icebergs_df.columns):
+            coerced = icebergs_df[["lat", "lon"]].apply(pd.to_numeric, errors="coerce")
+            dropped_count = int(coerced.isna().any(axis=1).sum())
+
+        bergs = []
+        risk_pred = risk_advected = None
+        band_edges = [20.0, 40.0, 60.0, 80.0]
+        if risk_grid is not None:
+            pred_df = predict_iceberg_drift(icebergs_df, wind_df, hours=24.0)
+            for _, row in pred_df.iterrows():
+                if pd.isna(row.get("pred_lat")) or pd.isna(row.get("pred_lon")):
+                    continue
+                _id = row.get("id", "?")
+                if isinstance(_id, float) and _id.is_integer():
+                    _id = int(_id)
+                bergs.append({
+                    "id": _id,
+                    "mass_kt": None if pd.isna(row.get("mass_kt")) else float(row["mass_kt"]),
+                    "freeboard_m": None if pd.isna(row.get("freeboard_m")) else float(row["freeboard_m"]),
+                    "now_ll": [float(row["lat"]), float(row["lon"])],
+                    "plus24h_ll": [float(row["pred_lat"]), float(row["pred_lon"])],
+                    "vector_km": _km_between((row["lat"], row["lon"]), (row["pred_lat"], row["pred_lon"])),
+                })
+            drift_field = build_drift_field(wind_df)
+            risk_pred, risk_advected = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+            band_edges, _ = kmeans_band_edges(risk_pred)
+
+        return {
+            "bergs": bergs, "ridge": _ridge_status(),
+            "risk_grid": risk_grid, "risk_pred": risk_pred, "risk_advected": risk_advected,
+            "band_edges": band_edges, "kmeans_diagnostics": _state.get("kmeans_diagnostics"),
+            "dropped_count": dropped_count,
+        }
+    except Exception as e:
+        return {"error": f"Forecast computation failed: {e}"}
+
+
 def _compute_route(start_coord, goal_coord) -> dict:
-    """Mirrors app.py's _compute_route verbatim (app.py:413-546), state
-    dict in place of st.session_state. Raises on failure (unlike app.py's
-    bool-return form) -- the route caller below turns that into a 4xx."""
+    """Mirrors app.py's _compute_route (app.py:364-546), state dict in
+    place of st.session_state. Raises on failure (unlike app.py's
+    bool-return form) -- the route caller below turns that into a 4xx.
+    Extended this mission: keeps the full per-iceberg CPA table (not just
+    HIGH/MED prose lines -- LOW-tier icebergs used to be silently dropped
+    from all per-iceberg display) and the reroute path's own geometry
+    (previously discarded, now drawn on the map as a 3rd polyline)."""
     risk_grid = _state["risk_grid"]
     notes = []
 
@@ -387,7 +489,7 @@ def _compute_route(start_coord, goal_coord) -> dict:
         tracks.append((_id, curr_loc, pred_loc))
 
     drift_field = build_drift_field(_state["wind_df"])
-    risk_pred = predict_risk_grid(risk_grid, drift_field, hours=24.0)
+    risk_pred, _ = predict_risk_grid(risk_grid, drift_field, hours=24.0)
     risk_combined = np.maximum(risk_grid, risk_pred) if risk_grid is not None else None
     band_edges, band_src = kmeans_band_edges(risk_pred)
 
@@ -409,12 +511,18 @@ def _compute_route(start_coord, goal_coord) -> dict:
     reroute = suggest_reroute(risk_combined, start_coord, goal_coord, opt_path, risk_pred) if threat == "HIGH" else None
     suggestion = (f"suggested deviation +{reroute[1]:.1f} km" if reroute
                   else "no lower-exposure alternative found")
+
+    # Full CPA table -- every iceberg, not just HIGH/MED (those got silently
+    # dropped from all per-iceberg display before this mission).
+    cpa_table = []
     alerts = []
     for ib_id, cpa, curr_loc, pred_loc in sorted(cpas, key=lambda t: t[1]):
         lvl = classify_threat(cpa, 0)
+        along = _along_route_km(route_ll, [curr_loc, pred_loc]) if lvl in ("HIGH", "MED") else None
+        cpa_table.append({"id": ib_id, "cpa_km": cpa, "tier": lvl,
+                           "note": "monitor" if lvl == "MED" else ("reroute considered" if lvl == "HIGH" else "clear")})
         if lvl not in ("HIGH", "MED"):
             continue
-        along = _along_route_km(route_ll, [curr_loc, pred_loc])
         if lvl == "HIGH":
             if along is not None:
                 alerts.append({"level": "error", "text": f"HIGH: {ib_id} will cross your route in {along:.1f} km — {suggestion}"})
@@ -446,6 +554,7 @@ def _compute_route(start_coord, goal_coord) -> dict:
         "metrics": metrics, "icebergs": iceberg_pairs,
         "start_ll": start_ll, "goal_ll": goal_ll,
         "risk_pred": risk_pred, "band_edges": band_edges, "band_src": band_src,
+        "reroute_path": reroute[0] if reroute else None,
     }
     _state["last_route_start_ll"] = start_ll
 
@@ -461,10 +570,65 @@ def _compute_route(start_coord, goal_coord) -> dict:
     return {
         "start_ll": start_ll, "goal_ll": goal_ll,
         "metrics": metrics, "min_cpa_km": None if math.isinf(min_cpa) else min_cpa,
+        "cpa_table": cpa_table,
         "alerts": alerts, "notes": notes,
         "reroute_delta_km": reroute[1] if reroute else None,
         "strict_json": sj,
     }
+
+
+# -----------------------------------------------------------------------------
+# Sim Deck process management
+# -----------------------------------------------------------------------------
+def _read_pids() -> dict:
+    if not os.path.exists(PIDS_PATH):
+        return {}
+    try:
+        with open(PIDS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_pids(pids: dict):
+    try:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(PIDS_PATH, "w", encoding="utf-8") as f:
+            json.dump(pids, f)
+    except Exception:
+        pass
+
+
+def _pid_alive(pid) -> bool:
+    """Cross-platform liveness check, stdlib only. Required, not optional:
+    confirmed this mission that on this Windows machine, nmea_sim.py's own
+    SO_REUSEADDR setting lets a SECOND instance silently bind to the same
+    port with no exception -- so "try to start, catch an error" cannot be
+    trusted to detect an already-running sim; only an explicit liveness
+    check on our own recorded PID can."""
+    if not pid:
+        return False
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                                  capture_output=True, text=True, timeout=3)
+            return str(pid) in out.stdout
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _dir_count(path: str, dirs_only: bool = False) -> int:
+    if not os.path.isdir(path):
+        return 0
+    try:
+        names = os.listdir(path)
+        if dirs_only:
+            return sum(1 for n in names if os.path.isdir(os.path.join(path, n)))
+        return len(names)
+    except Exception:
+        return 0
 
 
 # -----------------------------------------------------------------------------
@@ -494,6 +658,12 @@ def status():
     except Exception:
         nmea_status = {"live": False}
 
+    try:
+        pids = _read_pids()
+        satcom_status = {"running": _pid_alive(pids.get("satcom"))}
+    except Exception:
+        satcom_status = {"running": False}
+
     iv = _state.get("ice_view")
     model_status = {"active_path": iv["active_path"] if iv else "not yet detected"}
 
@@ -505,7 +675,7 @@ def status():
         drop_status = {"age_h": age_h, "stale": age_h > 12}
 
     return {"watcher": watcher, "bus": bus_status, "nmea": nmea_status,
-            "model": model_status, "drop": drop_status}
+            "satcom": satcom_status, "model": model_status, "drop": drop_status}
 
 
 @app.post("/detect")
@@ -518,6 +688,188 @@ def detect():
     except Exception as e:
         detection = {"error": f"Ice detection failed: {e}"}
     return {"ingest": ingest_result, "detection": detection}
+
+
+@app.get("/forecast")
+def forecast():
+    b = _forecast_bundle()
+    if b.get("error"):
+        return b
+    edges = b["band_edges"]
+    heatmaps = {
+        "current": _grid_to_svg(b["risk_grid"], edges),
+        "predicted": _grid_to_svg(b["risk_pred"], edges),
+        "advected": _grid_to_svg(b["risk_advected"], edges),
+    }
+    return {
+        "bergs": b["bergs"], "ridge": b["ridge"], "heatmaps": heatmaps,
+        "band_edges": edges, "kmeans_diagnostics": b["kmeans_diagnostics"],
+        "dropped_count": b["dropped_count"],
+    }
+
+
+@app.get("/nsidc")
+def nsidc():
+    row = _state.get("seaice_context")
+    if row is None:
+        return {"available": False}
+    try:
+        coverage = extent_to_coverage(row["extent"])
+        blob_count = int(round(2 + coverage * 18))  # mirrors make_synthetic_sar's own inline formula
+    except Exception:
+        coverage, blob_count = None, None
+    return {"available": True, "row": row, "coverage_fraction": coverage, "blob_count": blob_count}
+
+
+@app.get("/drop/receipts")
+def drop_receipts():
+    validated = []
+    if os.path.isdir("drops_done"):
+        for name in sorted(os.listdir("drops_done"), reverse=True):
+            path = os.path.join("drops_done", name)
+            if os.path.isdir(path):
+                validated.append({"batch_id": name, "files": sorted(os.listdir(path))})
+    quarantined = []
+    if os.path.isdir("drops_quarantine"):
+        for name in sorted(os.listdir("drops_quarantine"), reverse=True):
+            path = os.path.join("drops_quarantine", name)
+            if not os.path.isdir(path):
+                continue
+            reason = ""
+            reason_path = os.path.join(path, "reason.txt")
+            if os.path.exists(reason_path):
+                try:
+                    with open(reason_path, encoding="utf-8") as f:
+                        reason = f.read()
+                except Exception:
+                    reason = ""
+            quarantined.append({"batch_id": name, "reason": reason})
+    return {"validated": validated, "quarantined": quarantined,
+            "validated_count": len(validated), "quarantined_count": len(quarantined)}
+
+
+@app.get("/system")
+def system():
+    commit = "unknown"
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT,
+            stderr=subprocess.DEVNULL, timeout=2,
+        ).decode().strip()
+    except Exception:
+        pass
+
+    telemetry_disabled = None
+    try:
+        with open(os.path.join(REPO_ROOT, ".streamlit", "config.toml"), encoding="utf-8") as f:
+            cfg_text = f.read()
+        telemetry_disabled = "gatherUsageStats" in cfg_text and "false" in cfg_text.split("gatherUsageStats")[1][:20]
+    except Exception:
+        pass
+
+    unet_path = os.path.join(REPO_ROOT, "models", "unet_weights.pth")
+    unet_exists = os.path.exists(unet_path)
+
+    return {
+        "commit": commit,
+        "telemetry_disabled": telemetry_disabled,
+        "tiles": "None (offline -- no basemap CDN)",
+        "model_registry": {
+            "unet_weights_present": unet_exists,
+            "unet_weights_size_kb": round(os.path.getsize(unet_path) / 1024.0, 1) if unet_exists else None,
+            "dice_status": "not yet measured (0 labelled training patches)",
+            "quantization": "not yet measured (no trained U-Net exists)",
+        },
+        "resource_budget": "CPU-only inference, target <2GB RAM",
+    }
+
+
+@app.get("/sims/status")
+def sims_status():
+    pids = _read_pids()
+    sims = {name: {"running": _pid_alive(pids.get(name)), "pid": pids.get(name)} for name in SIM_SCRIPTS}
+    started_at = _sim_started_at.get("satcom")
+    next_pass_in_s = None
+    if started_at and sims["satcom"]["running"]:
+        next_pass_in_s = max(0.0, _SIM_INTERVAL_S - ((time.time() - started_at) % _SIM_INTERVAL_S))
+    return {
+        "sims": sims,
+        "mode": "LIVE AUTO" if any(s["running"] for s in sims.values()) else "MANUAL",
+        "inbox": _dir_count("drops_in"), "done": _dir_count("drops_done", dirs_only=True),
+        "quarantine": _dir_count("drops_quarantine", dirs_only=True),
+        "interval_s": _SIM_INTERVAL_S, "next_pass_in_s": next_pass_in_s,
+    }
+
+
+@app.post("/sims/start")
+def sims_start():
+    pids = _read_pids()
+    results = {}
+    for name, argv in SIM_SCRIPTS.items():
+        if _pid_alive(pids.get(name)):
+            results[name] = {"ok": True, "detail": "already running"}
+            continue
+        if name == "satcom" and not os.path.isdir(os.path.join(REPO_ROOT, "drops_stock")):
+            results[name] = {"ok": False, "detail": "drops_stock/ not found -- run build_drops_stock.py first"}
+            continue
+        try:
+            proc = subprocess.Popen([sys.executable, *argv], cwd=REPO_ROOT)
+            pids[name] = proc.pid
+            if name == "satcom":
+                _sim_started_at["satcom"] = time.time()
+            results[name] = {"ok": True, "detail": f"started pid {proc.pid}"}
+        except Exception as e:
+            results[name] = {"ok": False, "detail": str(e)}
+    _write_pids(pids)
+    return results
+
+
+@app.post("/sims/stop")
+def sims_stop():
+    pids = _read_pids()
+    results = {}
+    for name in SIM_SCRIPTS:
+        pid = pids.get(name)
+        if not _pid_alive(pid):
+            results[name] = {"ok": True, "detail": "already stopped"}
+            continue
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=3)
+            else:
+                os.kill(pid, 15)
+            results[name] = {"ok": True, "detail": f"stopped pid {pid}"}
+        except Exception as e:
+            results[name] = {"ok": False, "detail": str(e)}
+    _write_pids({})
+    _sim_started_at.clear()
+    return results
+
+
+@app.post("/drop/now")
+def drop_now():
+    """Performs satcom_sim.py's own atomic delivery action once, directly,
+    independent of whether its timer loop is running -- there's no IPC to
+    the running process, so this mirrors its copy-to-.part+os.rename logic
+    verbatim (satcom_sim.py:51-58) rather than signaling it."""
+    global _drop_now_counter
+    stock_dir = os.path.join(REPO_ROOT, "drops_stock")
+    stock = sorted(f for f in os.listdir(stock_dir) if f.endswith(".zip")) if os.path.isdir(stock_dir) else []
+    if not stock:
+        raise HTTPException(status_code=409, detail="drops_stock/ has no .zip files -- run build_drops_stock.py first")
+    name = stock[_drop_now_counter % len(stock)]
+    _drop_now_counter += 1
+    in_dir = os.path.join(REPO_ROOT, "drops_in")
+    os.makedirs(in_dir, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(in_dir, f"{ts}_{name}")
+    tmp_dest = dest + ".part"
+    try:
+        shutil.copy(os.path.join(stock_dir, name), tmp_dest)
+        os.rename(tmp_dest, dest)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"drop failed: {e}")
+    return {"ok": True, "delivered": os.path.basename(dest)}
 
 
 @app.post("/route", response_model=RouteResponse)

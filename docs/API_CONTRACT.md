@@ -96,3 +96,34 @@ Note that `strict_json` itself never echoes `start`/`goal` even though it
 accepts them as parameters (verified by reading `engine.py`), which is
 why the outer `/route` response carries `start_ll`/`goal_ll` alongside it
 instead of expecting them inside `strict_json`.
+
+## v3 additions (completeness pass + Sim Deck)
+
+`POST /detect`'s `detection` object gained `guard_status`, `fallback_reason`,
+`otsu_threshold`, `inference_ms` (wall-clock, measured here in the adapter
+around the `detect_ice` call — not inside engine.py), a 32-bin `histogram`
+of the original image, and `orig_png_b64`/`mask_png_b64` base64 PNG
+previews. `POST /route`'s response gained `cpa_table` (every iceberg, not
+just HIGH/MED — LOW-tier icebergs used to be silently dropped from all
+per-iceberg display).
+
+| New route | Response | Notes |
+|---|---|---|
+| `GET /forecast` | `{bergs: [{id, mass_kt, freeboard_m, now_ll, plus24h_ll, vector_km}], ridge: {active, r2, provenance}, heatmaps: {current, predicted, advected} (inline SVG strings), band_edges, kmeans_diagnostics: {centroids, tier_multipliers}, dropped_count}` | Independent of `/route` — only needs `/detect` to have run. `ridge` reads `load_drift_model()` (already existed, never called by either UI before) and `drift_training_report.json` (already existed, never read at runtime before). The 3 heatmaps are genuinely distinct grids: `predicted` is max-floored by `current`, `advected` is not — see `engine.predict_risk_grid`'s docstring. |
+| `GET /nsidc` | `{available, row: {year,month,day,extent}, coverage_fraction, blob_count}` | `coverage_fraction` via `engine.extent_to_coverage` (already public, just never called outside `make_synthetic_sar`); `blob_count` mirrors `make_synthetic_sar`'s own inline `2 + coverage*18` formula. |
+| `GET /drop/receipts` | `{validated: [{batch_id, files}], quarantined: [{batch_id, reason}], validated_count, quarantined_count}` | Read-only directory scan of `drops_done/`/`drops_quarantine/` — reports what `drop_watcher.py` already decided, never re-verifies checksums itself. |
+| `GET /system` | `{commit, telemetry_disabled, tiles, model_registry: {unet_weights_present, unet_weights_size_kb, dice_status, quantization}, resource_budget}` | `commit` via `git rev-parse --short HEAD` (never raises; "unknown" on failure). Reports static, code/config-derived facts — not a live monitor of browser network traffic (that's the offline-grep gate + a real network-interception test instead). |
+| `GET /sims/status` | `{sims: {satcom,watcher,nmea: {running,pid}}, mode, inbox, done, quarantine, interval_s, next_pass_in_s}` | |
+| `POST /sims/start`, `POST /sims/stop` | `{<sim>: {ok, detail}}` per sim | Guarded subprocesses tracked in `runtime/sims.pids` (gitignored). Idempotent by design, not by accident: confirmed this mission that on Windows, `nmea_sim.py`'s `SO_REUSEADDR` setting lets a second instance silently bind to the same port with no exception, so "catch a bind error" can't detect an already-running sim — only an explicit PID-liveness check can, which is what these two routes do before spawning. |
+| `POST /drop/now` | `{ok, delivered}` | Performs `satcom_sim.py`'s own atomic delivery (copy to `.part` + `os.rename`) directly, once — there's no IPC to a possibly-running `satcom_sim.py` process, so this mirrors its logic verbatim rather than signaling it. |
+
+Engine.py itself gained 4 surgical return-signature extensions this
+mission (algorithms unchanged) so these values could be genuinely passed
+through rather than fabricated: `detect_ice` (now 5-tuple, `+diagnostics`
+dict), `_kmeans_risk_weights`/`build_risk_grid` (now `+diagnostics` dict
+with centroids/tier multipliers), `predict_risk_grid` (now
+`(combined, advected)` instead of just `combined`). See each function's
+own docstring in `engine.py` for the exact shape.
+
+The shared map builder (`mapview.py`, new) replaced this file's own
+`_build_map`/`_concentration_rgba` — see `docs/CONSOLE_PARITY.md`.
