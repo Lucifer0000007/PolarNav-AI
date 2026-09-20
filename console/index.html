@@ -13,38 +13,18 @@
     <span class="ice">&#10052;</span> PolarNav AI <span class="sep">&middot;</span> Edge Navigation Console
   </div>
   <div class="topbar-right">
-    <span class="badge badge-ok" id="edge-native-badge">EDGE-NATIVE</span>
     <span class="clock" id="utc-clock">--:--:--Z</span>
+    <span class="badge badge-ok" id="edge-native-badge">EDGE-NATIVE</span>
   </div>
 </header>
-
-<div class="status-strip" id="status-strip">
-  <span class="strip-item" id="strip-model">&mdash;</span>
-  <span class="strip-sep">&middot;</span>
-  <span class="strip-item">Offline &mdash; zero CDN, 127.0.0.1 only</span>
-  <span class="strip-sep">&middot;</span>
-  <span class="strip-item" id="strip-build">build &mdash;</span>
-</div>
 
 <div id="stale-banner" class="banner banner-warn" hidden></div>
 
 <div class="app-shell">
   <nav class="rail" aria-label="Sections">
-    <button class="rail-item active" data-view="ops">
+    <button class="rail-item active" data-view="mission">
       <svg class="rail-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="1.6" fill="currentColor" stroke="none"/></svg>
-      Ops
-    </button>
-    <button class="rail-item" data-view="detect">
-      <svg class="rail-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="6.8" cy="6.8" r="4.6"/><line x1="10.2" y1="10.2" x2="14" y2="14"/></svg>
-      Detect
-    </button>
-    <button class="rail-item" data-view="forecast">
-      <svg class="rail-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12h1a2.5 2.5 0 0 0 0-5 3.5 3.5 0 0 1 6.7-1.4A2.8 2.8 0 0 1 14 8.3 2.2 2.2 0 0 1 13.5 12H2z"/></svg>
-      Forecast
-    </button>
-    <button class="rail-item" data-view="route">
-      <svg class="rail-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="3" cy="13" r="1.6"/><circle cx="13" cy="3" r="1.6"/><path d="M4.2 12 Q8 4 11.8 4"/></svg>
-      Route
+      Mission
     </button>
     <button class="rail-item" data-view="data">
       <svg class="rail-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><ellipse cx="8" cy="4" rx="5.5" ry="2"/><path d="M2.5 4v8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2V4"/><path d="M2.5 8c0 1.1 2.5 2 5.5 2s5.5-.9 5.5-2"/></svg>
@@ -56,140 +36,171 @@
     </button>
   </nav>
 
-  <!-- ===================== OPS ===================== -->
-  <section class="view" id="view-ops">
-    <section class="kpi-row" aria-label="Route KPIs">
-      <div class="kpi-card" id="kpi-card-risk"><div class="kpi-label">Risk reduction</div><div class="kpi-value" id="kpi-risk-reduction">&mdash;</div></div>
-      <div class="kpi-card" id="kpi-card-distance"><div class="kpi-label">Distance cost</div><div class="kpi-value" id="kpi-distance">&mdash;</div></div>
-      <div class="kpi-card" id="kpi-card-cpa"><div class="kpi-label">Min CPA</div><div class="kpi-value" id="kpi-cpa">&mdash;</div></div>
-      <div class="kpi-card" id="kpi-card-model"><div class="kpi-label">Active model</div><div class="kpi-value kpi-value-text" id="kpi-model">&mdash;</div></div>
-    </section>
+  <!-- ===================== MISSION ===================== -->
+  <section class="view" id="view-mission">
+    <div class="panel sim-strip" id="sim-strip">
+      <span class="sim-mode-chip" id="sim-mode-chip">MANUAL</span>
+      <span class="sim-strip-sep">&middot;</span>
+      <span class="sim-strip-item">Inbox <b id="sim-count-inbox">0</b></span>
+      <span class="sim-strip-item">Done <b id="sim-count-done">0</b></span>
+      <span class="sim-strip-item">Quarantine <b id="sim-count-quarantine">0</b></span>
+      <span class="sim-strip-item">NMEA <b id="sim-nmea-hz">&mdash;</b></span>
+      <span class="sim-strip-item">Bus <b id="sim-bus-mode">&mdash;</b></span>
+      <svg class="sim-ring" viewBox="0 0 36 36" id="sim-ring" hidden>
+        <circle class="track" cx="18" cy="18" r="15"/>
+        <circle class="progress" cx="18" cy="18" r="15" id="sim-ring-progress" transform="rotate(-90 18 18)"/>
+      </svg>
+      <button id="btn-sim-toggle" class="btn btn-ok sim-strip-toggle">Go live</button>
+    </div>
+    <div id="sim-hint" class="sim-hint" hidden></div>
 
-    <div class="panel" id="sim-deck-panel">
-      <div class="panel-title">Sim deck <span class="sub">satcom &middot; watcher &middot; nmea</span></div>
-      <div class="sim-deck">
-        <span class="sim-mode-chip" id="sim-mode-chip">MANUAL</span>
-        <div class="sim-counters">
-          <span>Inbox <b id="sim-count-inbox">0</b></span>
-          <span>Done <b id="sim-count-done">0</b></span>
-          <span>Quarantine <b id="sim-count-quarantine">0</b></span>
-          <span>NMEA <b id="sim-nmea-hz">&mdash;</b></span>
-          <span>Bus <b id="sim-bus-mode">&mdash;</b></span>
+    <div class="mission-grid">
+      <div class="pipeline" id="pipeline">
+        <!-- ---- Stage 1: Ingest ---- -->
+        <div class="stage-row">
+        <div class="stage-rail"><span class="stage-num">1</span></div>
+        <section class="stage-card" id="stage-card-1" data-stage="1">
+          <div class="stage-head"><h3 class="stage-title">Ingest</h3></div>
+          <div class="stage-body">
+            <div class="stage-action">
+              <button id="btn-drop-now" class="btn btn-accent">Drop now</button>
+              <span class="caption">Simulates a satcom data drop, or waits for one in LIVE AUTO.</span>
+            </div>
+            <div id="ingest-messages" class="ingest-messages" hidden></div>
+          </div>
+        </section>
         </div>
-        <div style="display:flex; align-items:center; gap:10px;">
-          <svg class="sim-ring" viewBox="0 0 36 36" id="sim-ring" hidden>
-            <circle class="track" cx="18" cy="18" r="15"/>
-            <circle class="progress" cx="18" cy="18" r="15" id="sim-ring-progress" transform="rotate(-90 18 18)"/>
-          </svg>
-          <button id="btn-drop-now" class="btn btn-small">Drop now</button>
-          <button id="btn-sim-toggle" class="btn btn-ok">Go live</button>
+
+        <!-- ---- Stage 2: Detect ---- -->
+        <div class="stage-row">
+        <div class="stage-rail"><span class="stage-num">2</span></div>
+        <section class="stage-card is-locked" id="stage-card-2" data-stage="2">
+          <div class="stage-head"><h3 class="stage-title">Detect</h3></div>
+          <div class="stage-body">
+            <div class="stage-action">
+              <button id="btn-detect" class="btn btn-accent" disabled>Detect ice</button>
+              <span id="detect-caption" class="caption"></span>
+            </div>
+            <div class="kpi-row kpi-row-inline" id="kpi-row-detect" hidden>
+              <div class="kpi-card" id="kpi-card-model"><div class="kpi-label">Active model</div><div class="kpi-value kpi-value-text" id="kpi-model">&mdash;</div></div>
+            </div>
+            <div id="detect-view-body">
+              <div class="state-empty"><span class="state-icon">&#128269;</span>Complete Ingest, then click Detect ice, to see the mask, coverage, and model diagnostics here.</div>
+            </div>
+          </div>
+        </section>
+        </div>
+
+        <!-- ---- Stage 3: Forecast ---- -->
+        <div class="stage-row">
+        <div class="stage-rail"><span class="stage-num">3</span></div>
+        <section class="stage-card is-locked" id="stage-card-3" data-stage="3">
+          <div class="stage-head"><h3 class="stage-title">Forecast</h3></div>
+          <div class="stage-body">
+            <div class="stage-action">
+              <button id="btn-forecast" class="btn btn-accent" disabled>Forecast</button>
+              <span id="forecast-caption" class="caption"></span>
+            </div>
+            <div id="forecast-view-body">
+              <div class="state-empty"><span class="state-icon">&#9925;</span>Complete Detect, then click Forecast, to see drift predictions here.</div>
+            </div>
+          </div>
+        </section>
+        </div>
+
+        <!-- ---- Stage 4: Route ---- -->
+        <div class="stage-row">
+        <div class="stage-rail"><span class="stage-num">4</span></div>
+        <section class="stage-card is-locked" id="stage-card-4" data-stage="4">
+          <div class="stage-head"><h3 class="stage-title">Route</h3></div>
+          <div class="stage-body">
+            <div class="stage-action route-controls">
+              <label class="control-label" for="sel-start">Start</label>
+              <select id="sel-start" class="select"></select>
+              <label class="control-label" for="sel-goal">Goal</label>
+              <select id="sel-goal" class="select"></select>
+              <button id="btn-route" class="btn btn-accent" disabled>Compute route</button>
+              <span id="route-caption" class="caption"></span>
+              <span id="pos-badge" class="badge badge-dim">PINNED</span>
+            </div>
+            <div class="kpi-row kpi-row-inline" id="kpi-row-route" hidden>
+              <div class="kpi-card" id="kpi-card-risk"><div class="kpi-label">Risk reduction</div><div class="kpi-value" id="kpi-risk-reduction">&mdash;</div></div>
+              <div class="kpi-card" id="kpi-card-distance"><div class="kpi-label">Distance cost</div><div class="kpi-value" id="kpi-distance">&mdash;</div></div>
+              <div class="kpi-card" id="kpi-card-cpa"><div class="kpi-label">Min CPA</div><div class="kpi-value" id="kpi-cpa">&mdash;</div></div>
+            </div>
+            <div id="mission-route-log"></div>
+            <div id="route-view-body">
+              <div class="state-empty"><span class="state-icon">&#8987;</span>Complete Forecast, then compute a route, to see full metrics, CPA, and the strict-JSON payload here.</div>
+            </div>
+          </div>
+        </section>
         </div>
       </div>
-      <div id="sim-hint" class="sim-hint" hidden></div>
-    </div>
 
-    <section class="controls" aria-label="Voyage controls">
-      <button id="btn-detect" class="btn btn-accent">Ingest &amp; detect</button>
-      <span id="detect-caption" class="caption"></span>
-      <label class="control-label" for="sel-start">Start</label>
-      <select id="sel-start" class="select"></select>
-      <label class="control-label" for="sel-goal">Goal</label>
-      <select id="sel-goal" class="select"></select>
-      <button id="btn-route" class="btn btn-accent">Compute route</button>
-      <span id="route-caption" class="caption"></span>
-      <span id="pos-badge" class="badge badge-dim">PINNED</span>
-    </section>
-
-    <div id="ingest-messages" class="ingest-messages" hidden></div>
-
-    <section class="ticker-wrap" aria-label="Event stream">
-      <div class="ticker-label">Event stream</div>
-      <div class="ticker" id="ticker"><span class="ticker-track" id="ticker-track">waiting for events&hellip;</span></div>
-    </section>
-
-    <section class="main-grid">
-      <div class="panel map-panel">
-        <div class="panel-title">Navigation map</div>
-        <div class="map-instrument" id="map-instrument">
-          <iframe id="map-frame" src="/map" title="Navigation map"></iframe>
-          <svg class="bezel-svg" viewBox="0 0 300 522" preserveAspectRatio="none" aria-hidden="true">
-            <defs>
-              <clipPath id="chart-clip"><rect x="36" y="36" width="228" height="450"/></clipPath>
-            </defs>
-            <g class="bezel-rings" clip-path="url(#chart-clip)">
-              <circle cx="150" cy="261" r="70"/>
-              <circle cx="150" cy="261" r="140"/>
-              <circle cx="150" cy="261" r="210"/>
-              <circle cx="150" cy="261" r="280"/>
-            </g>
-            <g class="radar-sweep-group" clip-path="url(#chart-clip)">
-              <g class="radar-sweep-rotor">
-                <path class="radar-sweep" d="M150,261 L150,-239 A500,500 0 0,1 361.3,-192.15 Z"/>
-                <line class="radar-sweep-edge" x1="150" y1="261" x2="361.3" y2="-192.15"/>
+      <div class="situation" id="situation">
+        <div class="panel map-panel">
+          <div class="panel-title">Navigation map</div>
+          <div class="map-instrument" id="map-instrument">
+            <iframe id="map-frame" src="/map" title="Navigation map"></iframe>
+            <svg class="bezel-svg" viewBox="0 0 300 522" preserveAspectRatio="none" aria-hidden="true">
+              <defs>
+                <clipPath id="chart-clip"><rect x="36" y="36" width="228" height="450"/></clipPath>
+              </defs>
+              <g class="bezel-rings" clip-path="url(#chart-clip)">
+                <circle cx="150" cy="261" r="70"/>
+                <circle cx="150" cy="261" r="140"/>
+                <circle cx="150" cy="261" r="210"/>
+                <circle cx="150" cy="261" r="280"/>
               </g>
-            </g>
-            <g class="bezel-ticks">
-              <path d="M36,52 V36 H52"/>
-              <path d="M248,36 H264 V52"/>
-              <path d="M264,470 V486 H248"/>
-              <path d="M52,486 H36 V470"/>
-            </g>
-            <g class="bezel-scale">
-              <line x1="36" y1="36" x2="36" y2="486"/>
-              <line x1="30" y1="36" x2="36" y2="36"/><text x="26" y="40" text-anchor="end">0</text>
-              <line x1="30" y1="148.5" x2="36" y2="148.5"/><text x="26" y="152.5" text-anchor="end">25</text>
-              <line x1="30" y1="261" x2="36" y2="261"/><text x="26" y="265" text-anchor="end">50</text>
-              <line x1="30" y1="373.5" x2="36" y2="373.5"/><text x="26" y="377.5" text-anchor="end">75</text>
-              <line x1="30" y1="486" x2="36" y2="486"/><text x="26" y="490" text-anchor="end">100</text>
-              <text x="12" y="261" text-anchor="middle" transform="rotate(-90 12 261)" class="bezel-unit">km from N edge</text>
-            </g>
-            <g class="bezel-compass" transform="translate(282,18)">
-              <circle r="10"/>
-              <line x1="0" y1="-10" x2="0" y2="-6"/>
-              <line x1="0" y1="10" x2="0" y2="6"/>
-              <line x1="-10" y1="0" x2="-6" y2="0"/>
-              <line x1="10" y1="0" x2="6" y2="0"/>
-              <text x="0" y="-13" text-anchor="middle" class="bezel-n">N</text>
-            </g>
-          </svg>
+              <g class="radar-sweep-group" clip-path="url(#chart-clip)">
+                <g class="radar-sweep-rotor">
+                  <path class="radar-sweep" d="M150,261 L150,-239 A500,500 0 0,1 361.3,-192.15 Z"/>
+                  <line class="radar-sweep-edge" x1="150" y1="261" x2="361.3" y2="-192.15"/>
+                </g>
+              </g>
+              <g class="bezel-ticks">
+                <path d="M36,52 V36 H52"/>
+                <path d="M248,36 H264 V52"/>
+                <path d="M264,470 V486 H248"/>
+                <path d="M52,486 H36 V470"/>
+              </g>
+              <g class="bezel-scale">
+                <line x1="36" y1="36" x2="36" y2="486"/>
+                <line x1="30" y1="36" x2="36" y2="36"/><text x="26" y="40" text-anchor="end">0</text>
+                <line x1="30" y1="148.5" x2="36" y2="148.5"/><text x="26" y="152.5" text-anchor="end">25</text>
+                <line x1="30" y1="261" x2="36" y2="261"/><text x="26" y="265" text-anchor="end">50</text>
+                <line x1="30" y1="373.5" x2="36" y2="373.5"/><text x="26" y="377.5" text-anchor="end">75</text>
+                <line x1="30" y1="486" x2="36" y2="486"/><text x="26" y="490" text-anchor="end">100</text>
+                <text x="12" y="261" text-anchor="middle" transform="rotate(-90 12 261)" class="bezel-unit">km from N edge</text>
+              </g>
+              <g class="bezel-compass" transform="translate(282,18)">
+                <circle r="10"/>
+                <line x1="0" y1="-10" x2="0" y2="-6"/>
+                <line x1="0" y1="10" x2="0" y2="6"/>
+                <line x1="-10" y1="0" x2="-6" y2="0"/>
+                <line x1="10" y1="0" x2="6" y2="0"/>
+                <text x="0" y="-13" text-anchor="middle" class="bezel-n">N</text>
+              </g>
+            </svg>
+          </div>
+          <div class="legend">
+            <span class="legend-chip"><span class="legend-swatch" style="background:#22c55e"></span>Optimized route</span>
+            <span class="legend-chip"><span class="legend-swatch dash" style="color:#ff5c5c"></span>Direct route</span>
+            <span class="legend-chip"><span class="legend-swatch dash" style="color:#9aa4b2"></span>Suggested reroute</span>
+            <span class="legend-chip"><span class="legend-dot" style="background:#ff5c5c"></span>Iceberg (now)</span>
+            <span class="legend-chip"><span class="legend-dot" style="background:#f59e0b"></span>Iceberg (+24h)</span>
+            <span class="legend-chip"><span class="legend-dot" style="background:#5698ec"></span>24h ice concentration</span>
+          </div>
         </div>
-        <div class="legend">
-          <span class="legend-chip"><span class="legend-swatch" style="background:#22c55e"></span>Optimized route</span>
-          <span class="legend-chip"><span class="legend-swatch dash" style="color:#ff5c5c"></span>Direct route</span>
-          <span class="legend-chip"><span class="legend-swatch dash" style="color:#9aa4b2"></span>Suggested reroute</span>
-          <span class="legend-chip"><span class="legend-dot" style="background:#ff5c5c"></span>Iceberg (now)</span>
-          <span class="legend-chip"><span class="legend-dot" style="background:#f59e0b"></span>Iceberg (+24h)</span>
-          <span class="legend-chip"><span class="legend-dot" style="background:#5698ec"></span>24h ice concentration</span>
+        <div class="panel side-panel">
+          <div class="panel-title">Live alerts</div>
+          <div id="alerts" class="alerts"><div class="state-empty">Complete Detect, then Compute Route, to see alerts here.</div></div>
         </div>
+        <section class="ticker-wrap" aria-label="Event stream">
+          <div class="ticker-label">Event stream</div>
+          <div class="ticker" id="ticker"><span class="ticker-track" id="ticker-track">waiting for events&hellip;</span></div>
+        </section>
       </div>
-      <div class="panel side-panel">
-        <div class="panel-title">Live alerts</div>
-        <div id="alerts" class="alerts"><div class="state-empty">Run Ingest &amp; Detect, then Compute Route, to see alerts here.</div></div>
-      </div>
-    </section>
-  </section>
-
-  <!-- ===================== DETECT ===================== -->
-  <section class="view" id="view-detect" hidden>
-    <div class="view-header">Detect</div>
-    <div id="detect-view-body">
-      <div class="state-empty"><span class="state-icon">&#128269;</span>Run Ingest &amp; Detect on the Ops tab to see the mask, coverage, and model diagnostics here.</div>
-    </div>
-  </section>
-
-  <!-- ===================== FORECAST ===================== -->
-  <section class="view" id="view-forecast" hidden>
-    <div class="view-header">Forecast</div>
-    <div id="forecast-view-body">
-      <div class="state-empty"><span class="state-icon">&#9925;</span>Run Ingest &amp; Detect on the Ops tab to see drift forecasts here.</div>
-    </div>
-  </section>
-
-  <!-- ===================== ROUTE ===================== -->
-  <section class="view" id="view-route" hidden>
-    <div class="view-header">Route</div>
-    <div id="route-view-body">
-      <div class="state-empty"><span class="state-icon">&#8987;</span>Compute a route on the Ops tab to see full metrics, CPA, and the strict-JSON payload here.</div>
     </div>
   </section>
 

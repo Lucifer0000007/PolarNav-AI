@@ -6,6 +6,40 @@ let historyPage = 0;
 const HISTORY_PAGE_SIZE = 15;
 let lastHistoryRows = [];
 let autoReplanInFlight = false;
+let lastDoneCount = null;
+
+// Mission pipeline gating -- monotonic: once a stage unlocks the next, a
+// later re-run of an earlier stage never re-locks anything downstream (see
+// updateGating()). Seeded from the server once at load (initPipelineGating)
+// since _state is one process-wide dict, not a per-browser session -- a
+// client-cached flag could say "routed" after a server restart when
+// route_data is actually back to None.
+let stageComplete = { 1: false, 2: false, 3: false, 4: false };
+function setStageComplete(n) {
+  if (stageComplete[n]) return;
+  stageComplete[n] = true;
+  updateGating();
+}
+function updateGating() {
+  const BTN = { 2: "btn-detect", 3: "btn-forecast", 4: "btn-route" };
+  for (const n of [2, 3, 4]) {
+    const unlocked = stageComplete[n - 1];
+    const btn = document.getElementById(BTN[n]);
+    const card = document.getElementById(`stage-card-${n}`);
+    if (btn) btn.disabled = !unlocked;
+    if (card) card.classList.toggle("is-locked", !unlocked);
+  }
+}
+async function initPipelineGating() {
+  try {
+    const s = await getJSON("/status");
+    const p = s.pipeline || {};
+    if (p.ingested) setStageComplete(1);
+    if (p.detected) setStageComplete(2);
+    if (p.forecasted) setStageComplete(3);
+    if (p.routed) setStageComplete(4);
+  } catch (_) { /* stays fully locked -- safe default */ }
+}
 
 // Mirrors engine.py's GRID/LAT_MIN/LAT_MAX/LON_MIN/LON_MAX and the
 // _km_between/latlon_to_grid formulas verbatim -- same constants, same
@@ -35,9 +69,6 @@ function fmt1(n) { return (n == null || Number.isNaN(n)) ? "—" : Number(n).toF
 function switchView(name) {
   document.querySelectorAll(".rail-item").forEach(b => b.classList.toggle("active", b.dataset.view === name));
   document.querySelectorAll(".view").forEach(v => { v.hidden = v.id !== `view-${name}`; });
-  if (name === "detect") refreshDetectView();
-  if (name === "forecast") refreshForecastView();
-  if (name === "route") refreshRouteView();
   if (name === "data") refreshDataView();
   if (name === "system") refreshSystemView();
 }
@@ -119,8 +150,6 @@ async function refreshStatus() {
   setDot("dot-model", s.model.active_path !== "not yet detected");
 
   updateKpiText("kpi-model", s.model.active_path);
-  const stripModel = document.getElementById("strip-model");
-  if (stripModel) stripModel.textContent = s.model.active_path;
 
   const posBadge = document.getElementById("pos-badge");
   if (s.nmea.live && s.nmea.lat != null && s.nmea.lon != null) {
@@ -164,16 +193,16 @@ function flashArrive(valueId) {
   if (card) { card.classList.add("is-live"); setTimeout(() => card.classList.remove("is-live"), 900); }
 }
 
-// ---- /events polling: ticker ----
+// ---- /events polling: ticker (12 lines -- SYSTEM's own viewer asks for the full log separately) ----
 async function refreshEvents() {
   let events;
-  try { events = await getJSON("/events"); } catch (_) { return; }
+  try { events = await getJSON("/events?n=12"); } catch (_) { return; }
   const track = document.getElementById("ticker-track");
   if (!events.length) { track.textContent = "waiting for events…"; return; }
   track.textContent = events.map(e => `[${e.topic}] ${JSON.stringify(e.payload)}`).join("     •     ");
 }
 
-// ---- /history (backs both the OPS-era cache and the ROUTE tab's paged table) ----
+// ---- /history (backs both the mission log and DATA's paged table) ----
 async function refreshHistoryData() {
   try { lastHistoryRows = await getJSON("/history"); } catch (_) { /* keep previous */ }
 }
@@ -201,7 +230,7 @@ function renderHistoryPage(container) {
   if (next) next.addEventListener("click", () => { historyPage++; renderHistoryPage(container); });
 }
 
-// ---- Sim Deck ----
+// ---- Sim strip ----
 async function refreshSimDeck() {
   let s;
   try { s = await getJSON("/sims/status"); } catch (_) { return; }
@@ -214,7 +243,17 @@ async function refreshSimDeck() {
   document.getElementById("sim-count-done").textContent = s.done;
   document.getElementById("sim-count-quarantine").textContent = s.quarantine;
   document.getElementById("btn-sim-toggle").textContent = s.mode === "LIVE AUTO" ? "Stand down" : "Go live";
-  document.getElementById("btn-sim-toggle").className = s.mode === "LIVE AUTO" ? "btn btn-danger" : "btn btn-ok";
+  document.getElementById("btn-sim-toggle").className = s.mode === "LIVE AUTO" ? "btn btn-danger sim-strip-toggle" : "btn btn-ok sim-strip-toggle";
+
+  // LIVE AUTO auto-completes Stage 1 the instant a drop validates (done
+  // increments) -- watching this counter, not the /events ticker, because
+  // it's already polled here every 2s (zero new traffic), a monotonic-int
+  // increment can't be missed the way a last-20-lines-across-all-topics
+  // window could scroll a match out between polls, and a rejected/
+  // quarantined drop (which bumps "quarantine", not "done") correctly does
+  // NOT count.
+  if (lastDoneCount !== null && s.done > lastDoneCount) setStageComplete(1);
+  lastDoneCount = s.done;
 
   const ring = document.getElementById("sim-ring");
   if (s.mode === "LIVE AUTO" && s.next_pass_in_s != null) {
@@ -228,7 +267,6 @@ async function refreshSimDeck() {
     ring.hidden = true;
   }
 
-  const failures = Object.entries(s.sims).filter(([, v]) => v && v.ok === false);
   const hint = document.getElementById("sim-hint");
   if (window.__simLastAction && window.__simLastAction.length) {
     hint.hidden = false;
@@ -254,12 +292,14 @@ async function onSimToggle() {
   }
 }
 
+// ---- Stage 1: Ingest ----
 async function onDropNow() {
   const btn = document.getElementById("btn-drop-now");
   btn.disabled = true;
   try {
     await getJSON("/drop/now", { method: "POST" });
     window.__simLastAction = [["drop now", { ok: true, detail: "delivered to drops_in/" }]];
+    setStageComplete(1);
   } catch (e) {
     window.__simLastAction = [["drop now", { ok: false, detail: e.message }]];
   } finally {
@@ -268,7 +308,7 @@ async function onDropNow() {
   }
 }
 
-// ---- Ingest & Detect ----
+// ---- Stage 2: Detect ----
 async function onDetect() {
   const btn = document.getElementById("btn-detect");
   const caption = document.getElementById("detect-caption");
@@ -285,10 +325,13 @@ async function onDetect() {
     } else if (r.detection) {
       caption.textContent = `${r.ingest.source} — ${r.detection.n_cells} ice cells `
         + `(${r.detection.coverage_pct.toFixed(1)}% coverage, ${r.detection.inference_ms.toFixed(0)} ms)`;
+      window.__lastDetect = r.detection;
+      document.getElementById("kpi-row-detect").hidden = false;
+      renderDetectView();
+      setStageComplete(2);
     }
     // ingest.messages carries the per-line receipts (incl. NSIDC context and
-    // "using empty defaults" warnings) the API already builds -- previously
-    // fetched and silently discarded here.
+    // "using empty defaults" warnings) the API already builds.
     if (r.ingest.messages && r.ingest.messages.length) {
       msgBox.hidden = false;
       msgBox.innerHTML = r.ingest.messages.map(m =>
@@ -299,13 +342,110 @@ async function onDetect() {
   } finally {
     btn.disabled = false;
     refreshStatus();
-    if (!document.getElementById("view-detect").hidden) refreshDetectView();
-    if (!document.getElementById("view-forecast").hidden) refreshForecastView();
-    if (!document.getElementById("view-data").hidden) refreshDataView();
   }
 }
 
-// ---- Compute Route ----
+function renderDetectView() {
+  const el = document.getElementById("detect-view-body");
+  const d = window.__lastDetect;
+  if (!d) { el.innerHTML = stateEmpty("Complete Ingest, then click Detect ice, to see the mask, coverage, and model diagnostics here.", "&#128269;"); return; }
+  const histMax = Math.max(1, ...d.histogram);
+  const barW = 300 / d.histogram.length;
+  const bars = d.histogram.map((v, i) =>
+    `<rect x="${i * barW}" y="${80 - (v / histMax) * 76}" width="${barW - 1}" height="${(v / histMax) * 76}" fill="#7fd4ff"/>`).join("");
+  const thresholdX = d.otsu_threshold != null ? (d.otsu_threshold / 255) * 300 : null;
+  el.innerHTML = `
+    <div class="dgrid">
+      <div class="panel">
+        <div class="panel-title">SAR vs. detected mask</div>
+        <div class="img-compare">
+          <figure><img src="data:image/png;base64,${d.orig_png_b64}" alt="Original SAR"><figcaption>Original SAR</figcaption></figure>
+          <figure><img src="data:image/png;base64,${d.mask_png_b64}" alt="Detected mask"><figcaption>Detected ice mask</figcaption></figure>
+        </div>
+        <div class="status-grid" style="margin-top:12px">
+          <div class="status-row"><span class="k">Ice cells</span><span class="v">${d.n_cells}</span></div>
+          <div class="status-row"><span class="k">Coverage</span><span class="v">${d.coverage_pct.toFixed(1)}%</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Model diagnostics</div>
+        <div class="status-card">
+          <div class="status-row"><span class="k">Active model</span><span class="v">${esc(d.active_path)}</span></div>
+          <div class="status-row"><span class="k">Fallback reason</span><span class="v">${esc(d.fallback_reason || "—")}</span></div>
+          <div class="status-row"><span class="k">Guard status</span><span class="v">${esc(d.guard_status)}</span></div>
+          <div class="status-row"><span class="k">Inference time</span><span class="v">${d.inference_ms.toFixed(1)} ms</span></div>
+          <div class="status-row"><span class="k">Otsu threshold</span><span class="v">${d.otsu_threshold != null ? d.otsu_threshold.toFixed(0) : "n/a (SmallUNet path)"}</span></div>
+        </div>
+        <div class="histogram-wrap" style="margin-top:12px">
+          <div class="caption">Pixel intensity histogram</div>
+          <svg viewBox="0 0 300 84" preserveAspectRatio="none">${bars}${thresholdX != null ? `<line x1="${thresholdX}" y1="0" x2="${thresholdX}" y2="80" stroke="#ff5c5c" stroke-width="2"/>` : ""}</svg>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ---- Stage 3: Forecast ----
+async function onForecast() {
+  const btn = document.getElementById("btn-forecast");
+  const caption = document.getElementById("forecast-caption");
+  btn.disabled = true;
+  caption.innerHTML = '<span class="spinner"></span> forecasting…';
+  try {
+    const f = await getJSON("/forecast");
+    if (f.error) {
+      caption.textContent = f.error;
+    } else {
+      caption.textContent = "";
+      window.__lastForecast = f;
+      renderForecastView(f);
+      setStageComplete(3);
+    }
+  } catch (e) {
+    caption.textContent = "forecast failed: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderForecastView(f) {
+  const el = document.getElementById("forecast-view-body");
+  if (!f || f.error) { el.innerHTML = stateError((f && f.error) || "Forecast failed.", "onForecast"); return; }
+  if (!f.bergs.length && !f.heatmaps.current) {
+    el.innerHTML = stateEmpty("No forecast data yet.", "&#9925;");
+    return;
+  }
+  const kmeansLegend = f.kmeans_diagnostics ? f.kmeans_diagnostics.tier_multipliers.map((m, i) =>
+    `<span>Tier ${String.fromCharCode(65 + i)} ×${m.toFixed(1)} (centroid ${f.kmeans_diagnostics.centroids[i][0].toFixed(0)}kt / ${f.kmeans_diagnostics.centroids[i][1].toFixed(1)}m)</span>`).join("") : "";
+  el.innerHTML = `
+    <div class="panel">
+      <div class="panel-title">Ridge drift model <span class="sub">${f.ridge.active ? "active" : "inactive — physics fallback"}</span></div>
+      <div class="status-grid">
+        <div class="status-row"><span class="k">Held-out R²</span><span class="v">${f.ridge.r2 != null ? f.ridge.r2.toFixed(4) : "not yet measured"}</span></div>
+        <div class="status-row"><span class="k">Provenance</span><span class="v" style="font-family:inherit;font-size:0.8rem">${esc(f.ridge.provenance)}</span></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">24h ice concentration <span class="sub">rejected rows: ${f.dropped_count}</span></div>
+      <div class="dgrid-3">
+        ${["current", "predicted", "advected"].map(k => `
+          <div class="heatmap-wrap">${f.heatmaps[k] || '<div class="state-empty">n/a</div>'}
+            <div class="heatmap-label">${k === "current" ? "Current" : k === "predicted" ? "Predicted (24h, floored by current)" : "Pure advection (24h)"}</div>
+          </div>`).join("")}
+      </div>
+      ${kmeansLegend ? `<div class="tier-legend">${kmeansLegend}</div>` : ""}
+    </div>
+    <div class="panel">
+      <div class="panel-title">Per-iceberg drift</div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>id</th><th class="num">mass_kt</th><th class="num">freeboard_m</th><th>now</th><th>+24h</th><th class="num">vector_km</th></tr></thead>
+        <tbody>${f.bergs.map(b => `<tr><td>${b.id}</td><td class="num">${fmt1(b.mass_kt)}</td><td class="num">${fmt1(b.freeboard_m)}</td>
+          <td>${b.now_ll.map(fmt1).join(", ")}</td><td>${b.plus24h_ll.map(fmt1).join(", ")}</td>
+          <td class="num">${fmt1(b.vector_km)}</td></tr>`).join("")}</tbody>
+      </table></div>
+    </div>`;
+}
+
+// ---- Stage 4: Route ----
 // computeRoute() is the one shared path for both the manual button and the
 // autonomous drift-replan trigger below -- same request, same rendering, so
 // an auto-replan is visually indistinguishable from a manual one once it
@@ -317,7 +457,7 @@ async function computeRoute(start, goal) {
   renderRoute(r);
   document.getElementById("map-frame").src = "/map?t=" + Date.now();
   await refreshHistoryData();
-  if (!document.getElementById("view-route").hidden) refreshRouteView();
+  refreshRouteView();
   return r;
 }
 
@@ -369,112 +509,34 @@ function renderRoute(r) {
   updateKpiText("kpi-risk-reduction", r.metrics.risk_reduction_pct.toFixed(1) + "%");
   updateKpiText("kpi-distance", r.metrics.path_distance_km.toFixed(1) + " km");
   updateKpiText("kpi-cpa", r.min_cpa_km != null ? r.min_cpa_km.toFixed(1) + " km" : "—");
+  document.getElementById("kpi-row-route").hidden = false;
 
   const alertsEl = document.getElementById("alerts");
   alertsEl.innerHTML = r.alerts.map(a => `<div class="alert-card level-${a.level} arrive">${esc(a.text)}</div>`).join("");
 
   window.__lastRoute = r;
+  appendMissionRouteRow(r);
+  setStageComplete(4);
 }
 
-// ---- DETECT tab ----
-async function refreshDetectView() {
-  const el = document.getElementById("detect-view-body");
-  const iv = window.__lastDetect;
-  if (!iv) {
-    try {
-      const r = await getJSON("/detect", { method: "POST" });
-      window.__lastDetect = r.detection && !r.detection.error ? r.detection : null;
-    } catch (_) { /* keep null, fall through to empty state below */ }
-  }
-  renderDetectView();
+// One live-updated summary row, not a growing log -- the full history lives
+// on DATA now (renderHistoryPage(), unchanged); this just shows what the
+// route card's own last action produced, manual or auto-replanned alike.
+function appendMissionRouteRow(r) {
+  const el = document.getElementById("mission-route-log");
+  if (!el) return;
+  const ts = new Date().toISOString().slice(11, 19) + "Z";
+  el.innerHTML = `<div class="status-card"><div class="status-row">
+    <span class="k">Latest route (${ts})</span>
+    <span class="v">${fmt1(r.metrics.path_distance_km)} km &middot; ${fmt1(r.metrics.risk_reduction_pct)}% risk reduction</span>
+  </div></div>`;
 }
 
-function renderDetectView() {
-  const el = document.getElementById("detect-view-body");
-  const d = window.__lastDetect;
-  if (!d) { el.innerHTML = stateEmpty("Click “Ingest & Detect” on the Ops tab first.", "&#128269;"); return; }
-  const histMax = Math.max(1, ...d.histogram);
-  const barW = 300 / d.histogram.length;
-  const bars = d.histogram.map((v, i) =>
-    `<rect x="${i * barW}" y="${80 - (v / histMax) * 76}" width="${barW - 1}" height="${(v / histMax) * 76}" fill="#7fd4ff"/>`).join("");
-  const thresholdX = d.otsu_threshold != null ? (d.otsu_threshold / 255) * 300 : null;
-  el.innerHTML = `
-    <div class="dgrid">
-      <div class="panel">
-        <div class="panel-title">SAR vs. detected mask</div>
-        <div class="img-compare">
-          <figure><img src="data:image/png;base64,${d.orig_png_b64}" alt="Original SAR"><figcaption>Original SAR</figcaption></figure>
-          <figure><img src="data:image/png;base64,${d.mask_png_b64}" alt="Detected mask"><figcaption>Detected ice mask</figcaption></figure>
-        </div>
-        <div class="status-grid" style="margin-top:12px">
-          <div class="status-row"><span class="k">Ice cells</span><span class="v">${d.n_cells}</span></div>
-          <div class="status-row"><span class="k">Coverage</span><span class="v">${d.coverage_pct.toFixed(1)}%</span></div>
-        </div>
-      </div>
-      <div class="panel">
-        <div class="panel-title">Model diagnostics</div>
-        <div class="status-card">
-          <div class="status-row"><span class="k">Active model</span><span class="v">${esc(d.active_path)}</span></div>
-          <div class="status-row"><span class="k">Fallback reason</span><span class="v">${esc(d.fallback_reason || "—")}</span></div>
-          <div class="status-row"><span class="k">Guard status</span><span class="v">${esc(d.guard_status)}</span></div>
-          <div class="status-row"><span class="k">Inference time</span><span class="v">${d.inference_ms.toFixed(1)} ms</span></div>
-          <div class="status-row"><span class="k">Otsu threshold</span><span class="v">${d.otsu_threshold != null ? d.otsu_threshold.toFixed(0) : "n/a (SmallUNet path)"}</span></div>
-        </div>
-        <div class="histogram-wrap" style="margin-top:12px">
-          <div class="caption">Pixel intensity histogram</div>
-          <svg viewBox="0 0 300 84" preserveAspectRatio="none">${bars}${thresholdX != null ? `<line x1="${thresholdX}" y1="0" x2="${thresholdX}" y2="80" stroke="#ff5c5c" stroke-width="2"/>` : ""}</svg>
-        </div>
-      </div>
-    </div>`;
-}
-
-// ---- FORECAST tab ----
-async function refreshForecastView() {
-  const el = document.getElementById("forecast-view-body");
-  el.innerHTML = skeleton(4);
-  let f;
-  try { f = await getJSON("/forecast"); } catch (e) { el.innerHTML = stateError(e.message, "refreshForecastView"); return; }
-  if (f.error) { el.innerHTML = stateError(f.error, "refreshForecastView"); return; }
-  if (!f.bergs.length && !f.heatmaps.current) {
-    el.innerHTML = stateEmpty("Click “Ingest & Detect” on the Ops tab to forecast drift.", "&#9925;");
-    return;
-  }
-  const kmeansLegend = f.kmeans_diagnostics ? f.kmeans_diagnostics.tier_multipliers.map((m, i) =>
-    `<span>Tier ${String.fromCharCode(65 + i)} ×${m.toFixed(1)} (centroid ${f.kmeans_diagnostics.centroids[i][0].toFixed(0)}kt / ${f.kmeans_diagnostics.centroids[i][1].toFixed(1)}m)</span>`).join("") : "";
-  el.innerHTML = `
-    <div class="panel">
-      <div class="panel-title">Ridge drift model <span class="sub">${f.ridge.active ? "active" : "inactive — physics fallback"}</span></div>
-      <div class="status-grid">
-        <div class="status-row"><span class="k">Held-out R²</span><span class="v">${f.ridge.r2 != null ? f.ridge.r2.toFixed(4) : "not yet measured"}</span></div>
-        <div class="status-row"><span class="k">Provenance</span><span class="v" style="font-family:inherit;font-size:0.8rem">${esc(f.ridge.provenance)}</span></div>
-      </div>
-    </div>
-    <div class="panel">
-      <div class="panel-title">24h ice concentration <span class="sub">rejected rows: ${f.dropped_count}</span></div>
-      <div class="dgrid-3">
-        ${["current", "predicted", "advected"].map(k => `
-          <div class="heatmap-wrap">${f.heatmaps[k] || '<div class="state-empty">n/a</div>'}
-            <div class="heatmap-label">${k === "current" ? "Current" : k === "predicted" ? "Predicted (24h, floored by current)" : "Pure advection (24h)"}</div>
-          </div>`).join("")}
-      </div>
-      ${kmeansLegend ? `<div class="tier-legend">${kmeansLegend}</div>` : ""}
-    </div>
-    <div class="panel">
-      <div class="panel-title">Per-iceberg drift</div>
-      <div class="table-wrap"><table>
-        <thead><tr><th>id</th><th class="num">mass_kt</th><th class="num">freeboard_m</th><th>now</th><th>+24h</th><th class="num">vector_km</th></tr></thead>
-        <tbody>${f.bergs.map(b => `<tr><td>${b.id}</td><td class="num">${fmt1(b.mass_kt)}</td><td class="num">${fmt1(b.freeboard_m)}</td>
-          <td>${b.now_ll.map(fmt1).join(", ")}</td><td>${b.plus24h_ll.map(fmt1).join(", ")}</td>
-          <td class="num">${fmt1(b.vector_km)}</td></tr>`).join("")}</tbody>
-      </table></div>
-    </div>`;
-}
-
-// ---- ROUTE tab ----
+// ---- ROUTE card body ----
 function refreshRouteView() {
   const el = document.getElementById("route-view-body");
   const r = window.__lastRoute;
-  if (!r) { el.innerHTML = stateEmpty("Compute a route on the Ops tab first.", "&#8987;"); return; }
+  if (!r) { el.innerHTML = stateEmpty("Complete Forecast, then compute a route, to see full metrics, CPA, and the strict-JSON payload here.", "&#8987;"); return; }
   const m = r.metrics;
   const metricRows = [
     ["Distance (optimized)", fmt1(m.path_distance_km) + " km"], ["Distance (direct)", fmt1(m.direct_distance_km) + " km"],
@@ -500,18 +562,17 @@ function refreshRouteView() {
       </div>
     </div>
     <div class="panel">
-      <div class="panel-title">Route history <button id="btn-refresh-hist" class="btn btn-small">Refresh</button></div>
-      <div id="route-history-body"></div>
-    </div>
-    <div class="panel">
-      <div class="panel-title">Strict JSON (vessel-API-ready payload schema) <button id="btn-copy-json" class="btn btn-small">Copy</button></div>
-      <pre class="json-viewer">${highlightJson(r.strict_json)}</pre>
-      <div class="caption" style="margin-top:8px">${r.export_path
-        ? `Exported to <code>${esc(r.export_path)}</code> &middot; sha256 <code>${esc(r.sha256.slice(0, 12))}&hellip;</code>`
-        : `Export failed &mdash; sha256 <code>${esc(r.sha256.slice(0, 12))}&hellip;</code> (payload not written to disk)`}</div>
+      <details>
+        <summary class="panel-title" style="cursor:pointer">Strict JSON (vessel-API-ready payload schema)</summary>
+        <div style="margin-top:12px">
+          <button id="btn-copy-json" class="btn btn-small">Copy</button>
+          <pre class="json-viewer" style="margin-top:8px">${highlightJson(r.strict_json)}</pre>
+          <div class="caption" style="margin-top:8px">${r.export_path
+            ? `Exported to <code>${esc(r.export_path)}</code> &middot; sha256 <code>${esc(r.sha256.slice(0, 12))}&hellip;</code>`
+            : `Export failed &mdash; sha256 <code>${esc(r.sha256.slice(0, 12))}&hellip;</code> (payload not written to disk)`}</div>
+        </div>
+      </details>
     </div>`;
-  renderHistoryPage(document.getElementById("route-history-body"));
-  document.getElementById("btn-refresh-hist").addEventListener("click", async () => { await refreshHistoryData(); renderHistoryPage(document.getElementById("route-history-body")); });
   document.getElementById("btn-copy-json").addEventListener("click", () => {
     navigator.clipboard.writeText(JSON.stringify(r.strict_json, null, 2)).catch(() => {});
   });
@@ -521,28 +582,29 @@ function refreshRouteView() {
 async function refreshDataView() {
   const el = document.getElementById("data-view-body");
   el.innerHTML = skeleton(3);
-  let receipts, nsidc;
+  let receipts, nsidc, forecast;
   try {
-    [receipts, nsidc] = await Promise.all([getJSON("/drop/receipts"), getJSON("/nsidc")]);
+    [receipts, nsidc, forecast] = await Promise.all([getJSON("/drop/receipts"), getJSON("/nsidc"), getJSON("/forecast")]);
   } catch (e) {
     el.innerHTML = stateError(e.message, "refreshDataView");
     return;
   }
+  await refreshHistoryData();
   const nsidcCard = nsidc.available
     ? `<div class="status-grid">
         <div class="status-row"><span class="k">NSIDC date</span><span class="v">${nsidc.row.year}-${String(nsidc.row.month).padStart(2, "0")}-${String(nsidc.row.day).padStart(2, "0")}</span></div>
         <div class="status-row"><span class="k">Extent</span><span class="v">${fmt1(nsidc.row.extent)} M km²</span></div>
         <div class="status-row"><span class="k">Coverage mapping</span><span class="v">${nsidc.coverage_fraction != null ? (nsidc.coverage_fraction * 100).toFixed(1) + "% → " + nsidc.blob_count + " ice features" : "—"}</span></div>
       </div>`
-    : stateEmpty("No NSIDC sample yet — run Ingest & Detect.", "&#127484;");
+    : stateEmpty("No NSIDC sample yet — run Detect on the Mission tab.", "&#127484;");
   // DATA_LIST_CAP: /drop/receipts itself returns every batch ever validated/
   // quarantined (uncapped, by contract) -- a long-running Sim Deck session
-  // can accumulate hundreds of these (confirmed: 189 in one test run), so
-  // only the most recent DATA_LIST_CAP are rendered, same reasoning as the
-  // Route tab's history pager -- the API stays complete, only display caps.
+  // can accumulate hundreds of these, so only the most recent DATA_LIST_CAP
+  // are rendered -- the API stays complete, only display caps.
   const DATA_LIST_CAP = 15;
   const shownValidated = receipts.validated.slice(0, DATA_LIST_CAP);
   const shownQuarantined = receipts.quarantined.slice(0, DATA_LIST_CAP);
+  const droppedCount = (forecast && !forecast.error) ? forecast.dropped_count : 0;
   el.innerHTML = `
     <div class="panel"><div class="panel-title">NSIDC sample</div>${nsidcCard}</div>
     <div class="panel">
@@ -550,7 +612,7 @@ async function refreshDataView() {
       ${receipts.validated.length ? `<div class="table-wrap"><table><thead><tr><th>batch</th><th>files</th></tr></thead>
         <tbody>${shownValidated.map(v => `<tr><td>${esc(v.batch_id)}</td><td>${esc(v.files.join(", "))}</td></tr>`).join("")}</tbody></table></div>
         ${receipts.validated.length > DATA_LIST_CAP ? `<div class="caption" style="margin-top:8px">showing ${DATA_LIST_CAP} most recent of ${receipts.validated.length}</div>` : ""}`
-        : stateEmpty("No validated drops yet — start the Sim Deck on Ops and let drop_watcher run.", "&#128230;")}
+        : stateEmpty("No validated drops yet — start the Sim Deck on Mission and let drop_watcher run.", "&#128230;")}
     </div>
     <div class="panel">
       <div class="panel-title">Quarantine log <span class="sub">${receipts.quarantined_count} rejected</span></div>
@@ -558,16 +620,26 @@ async function refreshDataView() {
         `<div class="alert-card level-error"><b>${esc(q.batch_id)}</b><br>${esc(q.reason)}</div>`).join("")}</div>
         ${receipts.quarantined.length > DATA_LIST_CAP ? `<div class="caption" style="margin-top:8px">showing ${DATA_LIST_CAP} most recent of ${receipts.quarantined.length}</div>` : ""}`
         : stateEmpty("No quarantined batches.", "&#9989;")}
+    </div>
+    <div class="panel">
+      <div class="panel-title">Rejected rows</div>
+      <div class="status-card">${droppedCount} row(s) dropped from the current iceberg/wind data for invalid or missing lat/lon.</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Route history <button id="btn-refresh-hist" class="btn btn-small">Refresh</button></div>
+      <div id="route-history-body"></div>
     </div>`;
+  renderHistoryPage(document.getElementById("route-history-body"));
+  document.getElementById("btn-refresh-hist").addEventListener("click", async () => { await refreshHistoryData(); renderHistoryPage(document.getElementById("route-history-body")); });
 }
 
 // ---- SYSTEM tab ----
 async function refreshSystemView() {
   const el = document.getElementById("system-view-body");
   el.innerHTML = skeleton(4);
-  let sys, st;
+  let sys, st, events;
   try {
-    [sys, st] = await Promise.all([getJSON("/system"), getJSON("/status")]);
+    [sys, st, events] = await Promise.all([getJSON("/system"), getJSON("/status"), getJSON("/events?n=300")]);
   } catch (e) {
     el.innerHTML = stateError(e.message, "refreshSystemView");
     return;
@@ -614,26 +686,29 @@ async function refreshSystemView() {
           <div class="status-row"><span class="k">Resource budget</span><span class="v" style="font-family:inherit;font-size:0.8rem">${esc(sys.resource_budget)}</span></div>
         </div>
       </div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <div class="panel-title">Event log <span class="sub">${events.length} shown, newest first</span></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>topic</th><th>payload</th></tr></thead>
+        <tbody>${events.slice().reverse().map(e => {
+          const payload = JSON.stringify(e.payload);
+          const shown = payload.length > 200 ? payload.slice(0, 200) + "…" : payload;
+          return `<tr><td>${esc(e.topic)}</td><td>${esc(shown)}</td></tr>`;
+        }).join("")}</tbody>
+      </table></div>
     </div>`;
-}
-
-// ---- status strip: build/commit is static for the process lifetime, so
-// this is the only thing on the page fetched once instead of polled ----
-async function initStatusStrip() {
-  try {
-    const sys = await getJSON("/system");
-    document.getElementById("strip-build").textContent = `build ${sys.commit}`;
-  } catch (_) { /* leave the placeholder */ }
 }
 
 // ---- wiring ----
 document.getElementById("btn-detect").addEventListener("click", onDetect);
+document.getElementById("btn-forecast").addEventListener("click", onForecast);
 document.getElementById("btn-route").addEventListener("click", onRoute);
 document.getElementById("btn-sim-toggle").addEventListener("click", onSimToggle);
 document.getElementById("btn-drop-now").addEventListener("click", onDropNow);
 
 populateSelects();
-initStatusStrip();
+initPipelineGating();
 tickClock();
 setInterval(tickClock, 1000);
 refreshStatus();

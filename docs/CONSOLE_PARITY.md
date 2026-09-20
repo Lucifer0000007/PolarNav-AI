@@ -1,5 +1,14 @@
 # Console / Streamlit parity
 
+> **Superseded UI references, 2026-09-20**: the PASS/FAIL entries below that
+> name a console tab (OPS/DETECT/FORECAST/ROUTE) were verified against the
+> pre-redesign 6-tab layout. The "Mission Control redesign" mission
+> collapsed those 4 into one MISSION tab's 4 stage cards (DATA/SYSTEM
+> unchanged) — same endpoints, same underlying logic, just relocated. The
+> functional PASS results still hold; only the tab names are stale. Left
+> as historical record rather than rewritten, since these were genuine
+> point-in-time verification runs.
+
 `api.py` cannot import `app.py` (it runs `st.*` calls at module scope on
 load, which breaks outside a real Streamlit run), and `app.py` is out of
 scope to edit for this mission. So the handful of app.py helpers the

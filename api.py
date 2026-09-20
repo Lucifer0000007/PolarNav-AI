@@ -395,6 +395,20 @@ def _detect(sar_path: str) -> dict:
     inference_ms = (time.perf_counter() - t0) * 1000.0
     _state["risk_grid"], _state["kmeans_diagnostics"] = build_risk_grid(
         mask_img, GRID, icebergs_df=_state["icebergs_df"])
+
+    # Starts (not appends to) route_data: a fresh detect means a fresh
+    # pipeline run, so any Stage-3/4 overlay from a previous run must not
+    # linger on the map under new Stage-2 data. icebergs_current is a plain
+    # lat/lon list -- free at this point since positions are loaded
+    # independently of any drift math, unlike the (curr,pred) pairs
+    # _forecast_bundle()/_compute_route() build once drift is predicted.
+    icebergs_df = _state["icebergs_df"]
+    icebergs_current = []
+    if not icebergs_df.empty and {"lat", "lon"}.issubset(icebergs_df.columns):
+        coerced = icebergs_df[["lat", "lon"]].apply(pd.to_numeric, errors="coerce")
+        icebergs_current = coerced.dropna().values.tolist()
+    _state["route_data"] = {"risk_grid": _state["risk_grid"], "icebergs_current": icebergs_current}
+
     _src = resolve_sar_path(sar_path)
     hist_counts, _ = np.histogram(orig_img, bins=32, range=(0, 255))
 
@@ -452,6 +466,15 @@ def _forecast_bundle() -> dict:
             drift_field = build_drift_field(wind_df)
             risk_pred, risk_advected = predict_risk_grid(risk_grid, drift_field, hours=24.0)
             band_edges, _ = kmeans_band_edges(risk_pred)
+
+            # Merge into route_data (started by _detect()) so the map can
+            # show this stage's frame -- previously this was computed only
+            # for this function's own HTTP response and never reached /map.
+            _state["route_data"] = {
+                **(_state.get("route_data") or {}),
+                "risk_pred": risk_pred, "band_edges": band_edges,
+                "icebergs": [(b["now_ll"], b["plus24h_ll"]) for b in bergs],
+            }
 
         return {
             "bergs": bergs, "ridge": _ridge_status(),
@@ -552,7 +575,12 @@ def _compute_route(start_coord, goal_coord) -> dict:
         path_json=[grid_to_latlon(r, c) for r, c in opt_path],
     )
 
+    # Spread-merge (not a fresh literal): preserves whatever _detect()/
+    # _forecast_bundle() already staged into route_data earlier in this
+    # pipeline run (risk_grid, icebergs_current) instead of clobbering it --
+    # this dict is now built incrementally across the 3 stages, not just here.
     _state["route_data"] = {
+        **(_state.get("route_data") or {}),
         "path": opt_path, "direct": dir_path, "drift_list": drift_list,
         "metrics": metrics, "icebergs": iceberg_pairs,
         "start_ll": start_ll, "goal_ll": goal_ll,
@@ -699,8 +727,22 @@ def status():
         age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600.0
         drop_status = {"age_h": age_h, "stale": age_h > 12}
 
+    # Additive: lets the console reconstruct pipeline-stage gating on page
+    # load from server-side truth instead of a client-cached flag -- _state
+    # is one process-wide dict (single-operator demo), so a stale
+    # localStorage flag could say "routed" after a server restart when
+    # route_data is actually back to None.
+    rd = _state.get("route_data")
+    pipeline_status = {
+        "ingested": iv is not None or last is not None,
+        "detected": iv is not None,
+        "forecasted": bool(rd and rd.get("risk_pred") is not None),
+        "routed": bool(rd and rd.get("path") is not None),
+    }
+
     return {"watcher": watcher, "bus": bus_status, "nmea": nmea_status,
-            "satcom": satcom_status, "model": model_status, "drop": drop_status}
+            "satcom": satcom_status, "model": model_status, "drop": drop_status,
+            "pipeline": pipeline_status}
 
 
 @app.post("/detect")
@@ -914,8 +956,12 @@ def get_map():
 
 
 @app.get("/events")
-def events():
-    return bus.tail(20)
+def events(n: int = 20):
+    # Clamped, not trusted verbatim: bus.tail() reads the whole events.log
+    # into memory regardless of n, so an unbounded query value would be a
+    # free cost amplifier for no benefit -- MISSION's ticker asks for 12,
+    # SYSTEM's full viewer asks for 300; the clamp is the only guard needed.
+    return bus.tail(max(1, min(n, 300)))
 
 
 @app.get("/history")

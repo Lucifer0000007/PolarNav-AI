@@ -130,8 +130,25 @@ def build_map(rd: Optional[dict], *, leaflet_prefix: str,
         ).add_to(m)
 
     if rd is None:
-        return m
+        return m  # Stage 1 frame: bare AOI only
 
+    # Stage 2 frame: ice just detected, no drift predicted yet -- a plain
+    # tint from the raw (non-predicted) risk grid + undrifted iceberg dots.
+    # Superseded by the richer Stage-3 blocks below once forecast has run
+    # (guarded by "not already have icebergs pairs" so both never draw at
+    # once).
+    if rd.get("risk_grid") is not None and not rd.get("icebergs"):
+        folium.raster_layers.ImageOverlay(
+            image=concentration_rgba(rd["risk_grid"], rd.get("band_edges") or [20, 40, 60, 80]),
+            bounds=[[lat_min, lon_min], [lat_max, lon_max]],
+            opacity=0.30, origin="upper", mercator_project=False,
+            name="Detected ice concentration",
+        ).add_to(m)
+        for lat, lon in rd.get("icebergs_current") or []:
+            folium.CircleMarker([lat, lon], color='#ff5c5c', radius=5, fill=True, fill_opacity=0.9,
+                                 tooltip="iceberg (detected)").add_to(m)
+
+    # Stage 3 frame: forecast has run -- predicted overlay + drift arrows.
     if rd.get("risk_pred") is not None:
         folium.raster_layers.ImageOverlay(
             image=concentration_rgba(rd["risk_pred"], rd.get("band_edges") or [20, 40, 60, 80]),
@@ -140,31 +157,33 @@ def build_map(rd: Optional[dict], *, leaflet_prefix: str,
             name="Predicted ice concentration (24 h)",
         ).add_to(m)
 
-    for curr_loc, pred_loc in rd["icebergs"]:
+    for curr_loc, pred_loc in rd.get("icebergs") or []:
         folium.CircleMarker(curr_loc, color='#ff5c5c', radius=5, fill=True, fill_opacity=0.9,
                              tooltip="iceberg (now)").add_to(m)
         folium.CircleMarker(pred_loc, color='#f59e0b', radius=5, fill=True, fill_opacity=0.9,
                              tooltip="iceberg (+24h)").add_to(m)
         folium.PolyLine([curr_loc, pred_loc], color='#f59e0b', dash_array='5', weight=2).add_to(m)
 
-    opt_latlon = [grid_to_latlon(r, c) for r, c in rd["path"]]
-    dir_latlon = [grid_to_latlon(r, c) for r, c in rd["direct"]]
-    # Casing + glow: a wide, translucent line under a crisp core line, so
-    # the route reads as the clear focal element instead of a thin stroke.
-    folium.PolyLine(opt_latlon, color='#22c55e', weight=12, opacity=0.22).add_to(m)
-    folium.PolyLine(opt_latlon, color='#22c55e', weight=6, opacity=1.0).add_to(m)
-    folium.PolyLine(dir_latlon, color='#ff5c5c', dash_array='10 10', weight=4, opacity=0.6).add_to(m)
-    if rd.get("reroute_path"):
-        reroute_latlon = [grid_to_latlon(r, c) for r, c in rd["reroute_path"]]
-        folium.PolyLine(reroute_latlon, color='#9aa4b2', dash_array='4 6', weight=3, opacity=0.8).add_to(m)
+    # Stage 4 frame: route computed -- pins + optimized/direct/reroute lines.
+    if rd.get("path") and rd.get("direct"):
+        opt_latlon = [grid_to_latlon(r, c) for r, c in rd["path"]]
+        dir_latlon = [grid_to_latlon(r, c) for r, c in rd["direct"]]
+        # Casing + glow: a wide, translucent line under a crisp core line, so
+        # the route reads as the clear focal element instead of a thin stroke.
+        folium.PolyLine(opt_latlon, color='#22c55e', weight=12, opacity=0.22).add_to(m)
+        folium.PolyLine(opt_latlon, color='#22c55e', weight=6, opacity=1.0).add_to(m)
+        folium.PolyLine(dir_latlon, color='#ff5c5c', dash_array='10 10', weight=4, opacity=0.6).add_to(m)
+        if rd.get("reroute_path"):
+            reroute_latlon = [grid_to_latlon(r, c) for r, c in rd["reroute_path"]]
+            folium.PolyLine(reroute_latlon, color='#9aa4b2', dash_array='4 6', weight=3, opacity=0.8).add_to(m)
 
-    start_icon = folium.DivIcon(html=(
-        '<div style="width:22px;height:22px;border-radius:50%;background:#7fd4ff;'
-        'border:2px solid #0b1526;box-shadow:0 0 0 4px rgba(127,212,255,0.25);"></div>'))
-    goal_icon = folium.DivIcon(html=(
-        '<div style="width:0;height:0;border-left:11px solid transparent;'
-        'border-right:11px solid transparent;border-bottom:18px solid #4ade80;"></div>'))
-    if opt_latlon:
-        folium.Marker(opt_latlon[0], icon=start_icon, tooltip="Start / ship").add_to(m)
-        folium.Marker(opt_latlon[-1], icon=goal_icon, tooltip="Goal / station").add_to(m)
+        start_icon = folium.DivIcon(html=(
+            '<div style="width:22px;height:22px;border-radius:50%;background:#7fd4ff;'
+            'border:2px solid #0b1526;box-shadow:0 0 0 4px rgba(127,212,255,0.25);"></div>'))
+        goal_icon = folium.DivIcon(html=(
+            '<div style="width:0;height:0;border-left:11px solid transparent;'
+            'border-right:11px solid transparent;border-bottom:18px solid #4ade80;"></div>'))
+        if opt_latlon:
+            folium.Marker(opt_latlon[0], icon=start_icon, tooltip="Start / ship").add_to(m)
+            folium.Marker(opt_latlon[-1], icon=goal_icon, tooltip="Goal / station").add_to(m)
     return m

@@ -17,7 +17,7 @@ the server is running.
 | `POST /detect` | *(empty body)* | see below | `resolve_sar_path`, `detect_ice`, `build_risk_grid` |
 | `POST /route` | `{"start":[r,c], "goal":[r,c]}` | see below | `predict_iceberg_drift`, `build_drift_field`, `predict_risk_grid`, `kmeans_band_edges`, `astar`, `direct_path`, `route_metrics`, `cpa_km`, `classify_threat`, `suggest_reroute`, `save_route`, `strict_json` |
 | `GET /map` | – | `text/html`, a full folium document for the map `<iframe>` | `grid_to_latlon` |
-| `GET /events` | – | last 20 events, oldest-first | `bus.tail(20)` |
+| `GET /events?n=20` | – | last `n` events (clamped 1-300), oldest-first | `bus.tail(n)` |
 | `GET /history` | – | all saved routes, newest-first | `load_routes()` |
 
 ### `GET /status`
@@ -26,13 +26,20 @@ the server is running.
 {
   "watcher": {"fresh": true, "age_s": 4.2},
   "bus": {"mode": "file"},
-  "nmea": {"live": false},
+  "nmea": {"live": false, "lat": null, "lon": null},
   "model": {"active_path": "Active model: OpenCV Otsu (fallback)"},
-  "drop": {"age_h": 0.1, "stale": false}
+  "drop": {"age_h": 0.1, "stale": false},
+  "pipeline": {"ingested": false, "detected": false, "forecasted": false, "routed": false}
 }
 ```
 `watcher.fresh` mirrors app.py's M4 dot (`drops_done/latest_receipt.json`
 mtime < 60s). `drop.stale` mirrors app.py's M5 banner (`age_h > 12`).
+`nmea.lat`/`lon` (added: GPS-drift auto-replan mission) let the client
+track drift itself, same math as `_km_between`/`latlon_to_grid`, ported to
+JS. `pipeline` (added: Mission Control redesign) reconstructs the MISSION
+tab's 4-stage gating state on page load from live `_state`, not a
+client-cached flag — `_state` is one process-wide dict, so this is the
+only correct source after e.g. a server restart mid-session.
 
 ### `POST /detect`
 
