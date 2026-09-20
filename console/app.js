@@ -65,6 +65,44 @@ function fmtCoord([r, c]) { return `(${r}, ${c})`; }
 function esc(s) { const d = document.createElement("div"); d.textContent = String(s); return d.innerHTML; }
 function fmt1(n) { return (n == null || Number.isNaN(n)) ? "—" : Number(n).toFixed(1); }
 
+// U4-adjacent (fix c): path-like event-payload values render with escaped
+// backslashes if just JSON.stringify'd raw (Windows paths from
+// drop_watcher.py) -- basename() strips to just the filename.
+function basename(s) { return String(s).split(/[\\/]/).pop(); }
+function summarizePayload(payload) {
+  const parts = [];
+  for (const [k, v] of Object.entries(payload || {})) {
+    let val;
+    if (typeof v === "string" && /[\\/]/.test(v)) val = basename(v);
+    else if (Array.isArray(v)) val = `[${v.length}]`;
+    else if (v && typeof v === "object") val = "{…}";
+    else val = String(v);
+    parts.push(`${k}=${val}`);
+  }
+  const s = parts.join(", ");
+  return s.length > 80 ? s.slice(0, 80) + "…" : s;
+}
+
+// U5: api.py's /route unconditionally appends an info-level "Predicted
+// risk>5 cells on route: N" card even at N=0 -- fixed here, client-side,
+// rather than in api.py, since this pass's scope is console/* + the
+// folium bounds/fit call only. Drops the card entirely at N=0; folds it
+// into the matching MED icebreaking card as a detail when N>0, rather
+// than showing a second, separate card for the same fact.
+function mergeCrossingsAlert(alerts) {
+  const idx = alerts.findIndex(a => /^Predicted risk>5 cells on route: \d+$/.test(a.text));
+  if (idx === -1) return alerts;
+  const n = Number(alerts[idx].text.match(/(\d+)$/)[1]);
+  const rest = alerts.filter((_, i) => i !== idx);
+  if (n === 0) return rest;
+  const medIdx = rest.findIndex(a => a.text.includes("expect icebreaking"));
+  if (medIdx !== -1) {
+    rest[medIdx] = { ...rest[medIdx], text: `${rest[medIdx].text} (predicted risk>5 cells on route: ${n})` };
+    return rest;
+  }
+  return rest.concat([{ level: "info", text: `Predicted risk>5 cells on route: ${n}` }]);
+}
+
 // ---- tabs ----
 function switchView(name) {
   document.querySelectorAll(".rail-item").forEach(b => b.classList.toggle("active", b.dataset.view === name));
@@ -199,7 +237,13 @@ async function refreshEvents() {
   try { events = await getJSON("/events?n=12"); } catch (_) { return; }
   const track = document.getElementById("ticker-track");
   if (!events.length) { track.textContent = "waiting for events…"; return; }
-  track.textContent = events.map(e => `[${e.topic}] ${JSON.stringify(e.payload)}`).join("     •     ");
+  // fix (c): "HH:MM:SS · topic · short payload" chips, path values reduced
+  // to their basename -- previously one giant JSON.stringify'd line with
+  // escaped backslashes for every Windows path in the payload.
+  track.innerHTML = events.map(e => {
+    const hhmmss = (e.ts || "").slice(11, 19) || "--:--:--";
+    return `<span class="event-chip">${esc(hhmmss)} &middot; ${esc(e.topic)} &middot; ${esc(summarizePayload(e.payload))}</span>`;
+  }).join("");
 }
 
 // ---- /history (backs both the mission log and DATA's paged table) ----
@@ -237,8 +281,6 @@ async function refreshSimDeck() {
   const chip = document.getElementById("sim-mode-chip");
   chip.textContent = s.mode;
   chip.classList.toggle("live", s.mode === "LIVE AUTO");
-  const instrument = document.getElementById("map-instrument");
-  if (instrument) instrument.classList.toggle("live-sweep", s.mode === "LIVE AUTO");
   document.getElementById("sim-count-inbox").textContent = s.inbox;
   document.getElementById("sim-count-done").textContent = s.done;
   document.getElementById("sim-count-quarantine").textContent = s.quarantine;
@@ -512,7 +554,7 @@ function renderRoute(r) {
   document.getElementById("kpi-row-route").hidden = false;
 
   const alertsEl = document.getElementById("alerts");
-  alertsEl.innerHTML = r.alerts.map(a => `<div class="alert-card level-${a.level} arrive">${esc(a.text)}</div>`).join("");
+  alertsEl.innerHTML = mergeCrossingsAlert(r.alerts).map(a => `<div class="alert-card level-${a.level} arrive">${esc(a.text)}</div>`).join("");
 
   window.__lastRoute = r;
   appendMissionRouteRow(r);
@@ -555,7 +597,7 @@ function refreshRouteView() {
       </div>
       <div class="panel">
         <div class="panel-title">CPA by iceberg</div>
-        <div class="table-wrap"><table>
+        <div class="table-wrap cpa-table"><table>
           <thead><tr><th>id</th><th class="num">CPA (km)</th><th>tier</th><th>note</th></tr></thead>
           <tbody>${r.cpa_table.map(c => `<tr><td>${c.id}</td><td class="num">${fmt1(c.cpa_km)}</td><td>${c.tier}</td><td>${esc(c.note)}</td></tr>`).join("")}</tbody>
         </table></div>
@@ -690,12 +732,10 @@ async function refreshSystemView() {
     <div class="panel" style="margin-top:16px">
       <div class="panel-title">Event log <span class="sub">${events.length} shown, newest first</span></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>topic</th><th>payload</th></tr></thead>
-        <tbody>${events.slice().reverse().map(e => {
-          const payload = JSON.stringify(e.payload);
-          const shown = payload.length > 200 ? payload.slice(0, 200) + "…" : payload;
-          return `<tr><td>${esc(e.topic)}</td><td>${esc(shown)}</td></tr>`;
-        }).join("")}</tbody>
+        <thead><tr><th>time</th><th>topic</th><th>payload</th></tr></thead>
+        <tbody>${events.slice().reverse().map(e =>
+          `<tr><td>${esc((e.ts || "").slice(11, 19) || "--:--:--")}</td><td>${esc(e.topic)}</td><td>${esc(summarizePayload(e.payload))}</td></tr>`
+        ).join("")}</tbody>
       </table></div>
     </div>`;
 }
