@@ -5,6 +5,27 @@ const COORD_PRESETS = [[5, 5], [10, 15], [20, 20], [35, 35]]; // mirrors app.py'
 let historyPage = 0;
 const HISTORY_PAGE_SIZE = 15;
 let lastHistoryRows = [];
+let autoReplanInFlight = false;
+
+// Mirrors engine.py's GRID/LAT_MIN/LAT_MAX/LON_MIN/LON_MAX and the
+// _km_between/latlon_to_grid formulas verbatim -- same constants, same
+// math, so the browser can detect GPS drift and trigger an auto-replan
+// itself, the way app.py's _position_badge() fragment already does.
+const GRID_SIZE = 40, LAT_MIN = -68.0, LAT_MAX = -67.0, LON_MIN = 59.5, LON_MAX = 61.0;
+function kmBetween([lat1, lon1], [lat2, lon2]) {
+  const cosLat = Math.cos((lat1 + lat2) / 2 * Math.PI / 180);
+  const dlat = (lat2 - lat1) * 111.0;
+  const dlon = (lon2 - lon1) * 111.0 * cosLat;
+  return Math.hypot(dlat, dlon);
+}
+function latLonToGrid(lat, lon) {
+  const lonSpan = (LON_MAX - LON_MIN) || 1.0;
+  let r = GRID_SIZE * (1.0 - (lat - LAT_MIN));
+  let c = GRID_SIZE * (lon - LON_MIN) / lonSpan;
+  r = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(r)));
+  c = Math.max(0, Math.min(GRID_SIZE - 1, Math.round(c)));
+  return [r, c];
+}
 
 function fmtCoord([r, c]) { return `(${r}, ${c})`; }
 function esc(s) { const d = document.createElement("div"); d.textContent = String(s); return d.innerHTML; }
@@ -98,13 +119,20 @@ async function refreshStatus() {
   setDot("dot-model", s.model.active_path !== "not yet detected");
 
   updateKpiText("kpi-model", s.model.active_path);
+  const stripModel = document.getElementById("strip-model");
+  if (stripModel) stripModel.textContent = s.model.active_path;
 
   const posBadge = document.getElementById("pos-badge");
-  if (s.nmea.live) {
-    posBadge.textContent = "LIVE POS";
+  if (s.nmea.live && s.nmea.lat != null && s.nmea.lon != null) {
+    const [r, c] = latLonToGrid(s.nmea.lat, s.nmea.lon);
+    posBadge.textContent = `🛰 LIVE (${r}, ${c})`;
+    posBadge.title = `${s.nmea.lat.toFixed(3)}, ${s.nmea.lon.toFixed(3)} — auto-replans past 2 km drift `
+      + `(manual Start dropdown below still works independently)`;
     posBadge.className = "badge badge-ok";
+    maybeAutoReplan(s.nmea.lat, s.nmea.lon);
   } else {
-    posBadge.textContent = "PINNED";
+    posBadge.textContent = "📍 PINNED";
+    posBadge.title = "No live GPS feed (nmea_sim.py not reachable on 127.0.0.1:10110) — using the manual dropdown below";
     posBadge.className = "badge badge-dim";
   }
 
@@ -180,6 +208,8 @@ async function refreshSimDeck() {
   const chip = document.getElementById("sim-mode-chip");
   chip.textContent = s.mode;
   chip.classList.toggle("live", s.mode === "LIVE AUTO");
+  const instrument = document.getElementById("map-instrument");
+  if (instrument) instrument.classList.toggle("live-sweep", s.mode === "LIVE AUTO");
   document.getElementById("sim-count-inbox").textContent = s.inbox;
   document.getElementById("sim-count-done").textContent = s.done;
   document.getElementById("sim-count-quarantine").textContent = s.quarantine;
@@ -242,8 +272,10 @@ async function onDropNow() {
 async function onDetect() {
   const btn = document.getElementById("btn-detect");
   const caption = document.getElementById("detect-caption");
+  const msgBox = document.getElementById("ingest-messages");
   btn.disabled = true;
   caption.innerHTML = '<span class="spinner"></span> ingesting…';
+  msgBox.hidden = true;
   try {
     const r = await getJSON("/detect", { method: "POST" });
     if (r.ingest.error) {
@@ -253,6 +285,14 @@ async function onDetect() {
     } else if (r.detection) {
       caption.textContent = `${r.ingest.source} — ${r.detection.n_cells} ice cells `
         + `(${r.detection.coverage_pct.toFixed(1)}% coverage, ${r.detection.inference_ms.toFixed(0)} ms)`;
+    }
+    // ingest.messages carries the per-line receipts (incl. NSIDC context and
+    // "using empty defaults" warnings) the API already builds -- previously
+    // fetched and silently discarded here.
+    if (r.ingest.messages && r.ingest.messages.length) {
+      msgBox.hidden = false;
+      msgBox.innerHTML = r.ingest.messages.map(m =>
+        `<div class="msg-${m.level}">${esc(m.text)}</div>`).join("");
     }
   } catch (e) {
     caption.textContent = "detect failed: " + e.message;
@@ -266,22 +306,61 @@ async function onDetect() {
 }
 
 // ---- Compute Route ----
+// computeRoute() is the one shared path for both the manual button and the
+// autonomous drift-replan trigger below -- same request, same rendering, so
+// an auto-replan is visually indistinguishable from a manual one once it
+// lands (mirrors app.py's st.rerun() showing the identical page either way).
+async function computeRoute(start, goal) {
+  const r = await getJSON("/route", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start, goal }),
+  });
+  renderRoute(r);
+  document.getElementById("map-frame").src = "/map?t=" + Date.now();
+  await refreshHistoryData();
+  if (!document.getElementById("view-route").hidden) refreshRouteView();
+  return r;
+}
+
 async function onRoute() {
   const btn = document.getElementById("btn-route");
+  const caption = document.getElementById("route-caption");
   const start = parseSelected(document.getElementById("sel-start"));
   const goal = parseSelected(document.getElementById("sel-goal"));
   btn.disabled = true;
+  caption.innerHTML = '<span class="spinner"></span> routing…';
   try {
-    const r = await getJSON("/route", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ start, goal }),
-    });
-    renderRoute(r);
-    document.getElementById("map-frame").src = "/map?t=" + Date.now();
-    await refreshHistoryData();
-    if (!document.getElementById("view-route").hidden) refreshRouteView();
+    await computeRoute(start, goal);
+    caption.textContent = "";
   } catch (e) {
     document.getElementById("alerts").innerHTML = stateError("route failed: " + e.message, "onRoute");
+    caption.textContent = "";
   } finally {
+    btn.disabled = false;
+  }
+}
+
+// ---- Autonomous GPS-drift replan ----
+// Mirrors app.py's _position_badge() fragment exactly: once a route baseline
+// exists, a live fix that drifts past 2km from that baseline's start
+// triggers a fresh route to the same goal, and the new route's own start_ll
+// becomes the next baseline -- the same hysteresis app.py gets from
+// reassigning last_route_start_ll only after a successful replan.
+async function maybeAutoReplan(lat, lon) {
+  const btn = document.getElementById("btn-route");
+  if (autoReplanInFlight || btn.disabled) return;
+  const last = window.__lastRoute;
+  if (!last || !last.start_ll) return;
+  if (kmBetween(last.start_ll, [lat, lon]) <= 2.0) return;
+  autoReplanInFlight = true;
+  btn.disabled = true;
+  try {
+    const start = latLonToGrid(lat, lon);
+    const goal = parseSelected(document.getElementById("sel-goal"));
+    await computeRoute(start, goal);
+  } catch (_) {
+    // leave the old baseline in place -- the next 2s poll retries
+  } finally {
+    autoReplanInFlight = false;
     btn.disabled = false;
   }
 }
@@ -427,6 +506,9 @@ function refreshRouteView() {
     <div class="panel">
       <div class="panel-title">Strict JSON (vessel-API-ready payload schema) <button id="btn-copy-json" class="btn btn-small">Copy</button></div>
       <pre class="json-viewer">${highlightJson(r.strict_json)}</pre>
+      <div class="caption" style="margin-top:8px">${r.export_path
+        ? `Exported to <code>${esc(r.export_path)}</code> &middot; sha256 <code>${esc(r.sha256.slice(0, 12))}&hellip;</code>`
+        : `Export failed &mdash; sha256 <code>${esc(r.sha256.slice(0, 12))}&hellip;</code> (payload not written to disk)`}</div>
     </div>`;
   renderHistoryPage(document.getElementById("route-history-body"));
   document.getElementById("btn-refresh-hist").addEventListener("click", async () => { await refreshHistoryData(); renderHistoryPage(document.getElementById("route-history-body")); });
@@ -498,12 +580,12 @@ async function refreshSystemView() {
           <line x1="30" y1="30" x2="120" y2="30" class="topo-edge"/><line x1="120" y1="30" x2="120" y2="75" class="topo-edge"/>
           <line x1="30" y1="120" x2="120" y2="75" class="topo-edge"/><line x1="120" y1="75" x2="210" y2="75" class="topo-edge"/>
           <line x1="210" y1="75" x2="290" y2="40" class="topo-edge"/><line x1="210" y1="75" x2="290" y2="110" class="topo-edge"/>
-          <circle cx="30" cy="30" r="8" class="topo-dot ${st.satcom && st.satcom.running ? "live" : ""}"/><text x="30" y="16" class="topo-label">satcom</text>
-          <circle cx="120" cy="75" r="8" class="topo-dot ${st.watcher.fresh ? "live" : ""}"/><text x="120" y="61" class="topo-label">watcher</text>
-          <circle cx="30" cy="120" r="8" class="topo-dot ${st.nmea.live ? "live" : ""}"/><text x="30" y="140" class="topo-label">nmea</text>
-          <circle cx="210" cy="75" r="8" class="topo-dot live"/><text x="210" y="61" class="topo-label">app</text>
-          <circle cx="290" cy="40" r="8" class="topo-dot ${st.bus.mode === "kafka" ? "live" : ""}"/><text x="278" y="26" class="topo-label">bus</text>
-          <circle cx="290" cy="110" r="8" class="topo-dot ${st.model.active_path !== "not yet detected" ? "live" : ""}"/><text x="270" y="130" class="topo-label">model</text>
+          <circle id="dot-satcom" cx="30" cy="30" r="8" class="topo-dot ${st.satcom && st.satcom.running ? "live" : ""}"/><text x="30" y="16" class="topo-label">satcom</text>
+          <circle id="dot-watcher" cx="120" cy="75" r="8" class="topo-dot ${st.watcher.fresh ? "live" : ""}"/><text x="120" y="61" class="topo-label">watcher</text>
+          <circle id="dot-nmea" cx="30" cy="120" r="8" class="topo-dot ${st.nmea.live ? "live" : ""}"/><text x="30" y="140" class="topo-label">nmea</text>
+          <circle id="dot-app" cx="210" cy="75" r="8" class="topo-dot live"/><text x="210" y="61" class="topo-label">app</text>
+          <circle id="dot-bus" cx="290" cy="40" r="8" class="topo-dot ${st.bus.mode === "kafka" ? "live" : ""}"/><text x="278" y="26" class="topo-label">bus</text>
+          <circle id="dot-model" cx="290" cy="110" r="8" class="topo-dot ${st.model.active_path !== "not yet detected" ? "live" : ""}"/><text x="270" y="130" class="topo-label">model</text>
         </svg>
       </div>
       <div class="panel">
@@ -535,6 +617,15 @@ async function refreshSystemView() {
     </div>`;
 }
 
+// ---- status strip: build/commit is static for the process lifetime, so
+// this is the only thing on the page fetched once instead of polled ----
+async function initStatusStrip() {
+  try {
+    const sys = await getJSON("/system");
+    document.getElementById("strip-build").textContent = `build ${sys.commit}`;
+  } catch (_) { /* leave the placeholder */ }
+}
+
 // ---- wiring ----
 document.getElementById("btn-detect").addEventListener("click", onDetect);
 document.getElementById("btn-route").addEventListener("click", onRoute);
@@ -542,6 +633,7 @@ document.getElementById("btn-sim-toggle").addEventListener("click", onSimToggle)
 document.getElementById("btn-drop-now").addEventListener("click", onDropNow);
 
 populateSelects();
+initStatusStrip();
 tickClock();
 setInterval(tickClock, 1000);
 refreshStatus();
