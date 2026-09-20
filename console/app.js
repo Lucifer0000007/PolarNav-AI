@@ -453,18 +453,28 @@ async function refreshDataView() {
         <div class="status-row"><span class="k">Coverage mapping</span><span class="v">${nsidc.coverage_fraction != null ? (nsidc.coverage_fraction * 100).toFixed(1) + "% → " + nsidc.blob_count + " ice features" : "—"}</span></div>
       </div>`
     : stateEmpty("No NSIDC sample yet — run Ingest & Detect.", "&#127484;");
+  // DATA_LIST_CAP: /drop/receipts itself returns every batch ever validated/
+  // quarantined (uncapped, by contract) -- a long-running Sim Deck session
+  // can accumulate hundreds of these (confirmed: 189 in one test run), so
+  // only the most recent DATA_LIST_CAP are rendered, same reasoning as the
+  // Route tab's history pager -- the API stays complete, only display caps.
+  const DATA_LIST_CAP = 15;
+  const shownValidated = receipts.validated.slice(0, DATA_LIST_CAP);
+  const shownQuarantined = receipts.quarantined.slice(0, DATA_LIST_CAP);
   el.innerHTML = `
     <div class="panel"><div class="panel-title">NSIDC sample</div>${nsidcCard}</div>
     <div class="panel">
       <div class="panel-title">Drop receipts <span class="sub">${receipts.validated_count} validated</span></div>
       ${receipts.validated.length ? `<div class="table-wrap"><table><thead><tr><th>batch</th><th>files</th></tr></thead>
-        <tbody>${receipts.validated.map(v => `<tr><td>${esc(v.batch_id)}</td><td>${esc(v.files.join(", "))}</td></tr>`).join("")}</tbody></table></div>`
+        <tbody>${shownValidated.map(v => `<tr><td>${esc(v.batch_id)}</td><td>${esc(v.files.join(", "))}</td></tr>`).join("")}</tbody></table></div>
+        ${receipts.validated.length > DATA_LIST_CAP ? `<div class="caption" style="margin-top:8px">showing ${DATA_LIST_CAP} most recent of ${receipts.validated.length}</div>` : ""}`
         : stateEmpty("No validated drops yet — start the Sim Deck on Ops and let drop_watcher run.", "&#128230;")}
     </div>
     <div class="panel">
       <div class="panel-title">Quarantine log <span class="sub">${receipts.quarantined_count} rejected</span></div>
-      ${receipts.quarantined.length ? `<div class="alerts">${receipts.quarantined.map(q =>
-        `<div class="alert-card level-error"><b>${esc(q.batch_id)}</b><br>${esc(q.reason)}</div>`).join("")}</div>`
+      ${receipts.quarantined.length ? `<div class="alerts">${shownQuarantined.map(q =>
+        `<div class="alert-card level-error"><b>${esc(q.batch_id)}</b><br>${esc(q.reason)}</div>`).join("")}</div>
+        ${receipts.quarantined.length > DATA_LIST_CAP ? `<div class="caption" style="margin-top:8px">showing ${DATA_LIST_CAP} most recent of ${receipts.quarantined.length}</div>` : ""}`
         : stateEmpty("No quarantined batches.", "&#9989;")}
     </div>`;
 }
